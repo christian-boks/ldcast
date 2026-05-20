@@ -7,7 +7,11 @@ from . import autoenc
 def setup_autoenc_training(
     encoder,
     decoder,
-    model_dir
+    model_dir,
+    precision=None,
+    max_epochs=1000,
+    limit_train_batches=None,
+    limit_val_batches=None,
 ):
     autoencoder = autoenc.AutoencoderKL(encoder, decoder)
 
@@ -27,12 +31,19 @@ def setup_autoenc_training(
     )
     callbacks = [early_stopping, checkpoint]
 
-    trainer = pl.Trainer(
+    trainer_kwargs = dict(
         accelerator=accelerator,
         devices=devices,
-        max_epochs=1000,
-        strategy='dp' if (num_gpus > 1) else None,
-        callbacks=callbacks
+        max_epochs=max_epochs,
+        strategy=('ddp' if num_gpus > 1 else 'auto'),
+        callbacks=callbacks,
     )
+    if precision is not None:
+        trainer_kwargs["precision"] = precision
+    if limit_train_batches is not None:
+        trainer_kwargs["limit_train_batches"] = limit_train_batches
+    if limit_val_batches is not None:
+        trainer_kwargs["limit_val_batches"] = limit_val_batches
+    trainer = pl.Trainer(**trainer_kwargs)
 
     return (autoencoder, trainer)

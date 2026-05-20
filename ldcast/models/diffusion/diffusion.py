@@ -35,6 +35,7 @@ class LatentDiffusion(pl.LightningModule):
         linear_end=2e-2,
         cosine_s=8e-3,
         parameterization="eps",  # all assuming fixed variance schedules
+        optimizer_8bit=False,
     ):
         super().__init__()
         self.model = model
@@ -43,10 +44,11 @@ class LatentDiffusion(pl.LightningModule):
         self.context_encoder = context_encoder
         self.lr = lr
         self.lr_warmup = lr_warmup
+        self.optimizer_8bit = optimizer_8bit
 
         assert parameterization in ["eps", "x0"], 'currently only supporting "eps" and "x0"'
         self.parameterization = parameterization
-        
+
         self.use_ema = use_ema
         if self.use_ema:
             self.model_ema = LitEma(self.model)
@@ -175,10 +177,15 @@ class LatentDiffusion(pl.LightningModule):
             self.model_ema(self.model)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr,
-            betas=(0.5, 0.9), weight_decay=1e-3)
+        if self.optimizer_8bit:
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.AdamW8bit(self.parameters(), lr=self.lr,
+                betas=(0.5, 0.9), weight_decay=1e-3)
+        else:
+            optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr,
+                betas=(0.5, 0.9), weight_decay=1e-3)
         reduce_lr = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, patience=3, factor=0.25, verbose=True
+            optimizer, patience=3, factor=0.25
         )
         return {
             "optimizer": optimizer,
@@ -190,13 +197,12 @@ class LatentDiffusion(pl.LightningModule):
         }
 
     def optimizer_step(
-        self, 
+        self,
         epoch,
         batch_idx,
         optimizer,
-        optimizer_idx,
         optimizer_closure,
-        **kwargs    
+        **kwargs
     ):
         if self.trainer.global_step < self.lr_warmup:
             lr_scale = (self.trainer.global_step+1) / self.lr_warmup
@@ -204,8 +210,6 @@ class LatentDiffusion(pl.LightningModule):
                 pg['lr'] = lr_scale * self.lr
 
         super().optimizer_step(
-            epoch, batch_idx, optimizer,
-            optimizer_idx, optimizer_closure,
-            **kwargs
+            epoch, batch_idx, optimizer, optimizer_closure, **kwargs
         )
     

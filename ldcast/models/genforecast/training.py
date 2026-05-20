@@ -9,10 +9,16 @@ def setup_genforecast_training(
     autoencoder,
     context_encoder,
     model_dir,
-    lr=1e-4
+    lr=1e-4,
+    precision=None,
+    optimizer_8bit=False,
+    max_epochs=1000,
+    limit_train_batches=None,
+    limit_val_batches=None,
 ):
-    ldm = diffusion.LatentDiffusion(model, autoencoder, 
-        context_encoder=context_encoder, lr=lr)
+    ldm = diffusion.LatentDiffusion(model, autoencoder,
+        context_encoder=context_encoder, lr=lr,
+        optimizer_8bit=optimizer_8bit)
 
     num_gpus = torch.cuda.device_count()
     accelerator = "gpu" if (num_gpus > 0) else "cpu"
@@ -30,13 +36,19 @@ def setup_genforecast_training(
     )
     callbacks = [early_stopping, checkpoint]
 
-    trainer = pl.Trainer(
+    trainer_kwargs = dict(
         accelerator=accelerator,
         devices=devices,
-        max_epochs=1000,
-        strategy='dp' if (num_gpus > 1) else None,
+        max_epochs=max_epochs,
+        strategy=('ddp' if num_gpus > 1 else 'auto'),
         callbacks=callbacks,
-        #precision=16
     )
+    if precision is not None:
+        trainer_kwargs["precision"] = precision
+    if limit_train_batches is not None:
+        trainer_kwargs["limit_train_batches"] = limit_train_batches
+    if limit_val_batches is not None:
+        trainer_kwargs["limit_val_batches"] = limit_val_batches
+    trainer = pl.Trainer(**trainer_kwargs)
 
     return (ldm, trainer)

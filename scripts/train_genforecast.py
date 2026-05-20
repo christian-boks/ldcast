@@ -18,7 +18,12 @@ def setup_model(
     use_nwp=False,
     nwp_input_patches=4,
     num_nwp_vars=9,
-    lr=1e-4
+    lr=1e-4,
+    precision=None,
+    optimizer_8bit=False,
+    max_epochs=1000,
+    limit_train_batches=None,
+    limit_val_batches=None,
 ):
     enc = encoder.SimpleConvEncoder()
     dec = encoder.SimpleConvDecoder()    
@@ -64,7 +69,11 @@ def setup_model(
 
     (ldm, trainer) = training.setup_genforecast_training(
         model, autoencoder_obs, context_encoder=analysis_net,
-        model_dir=model_dir, lr=lr
+        model_dir=model_dir, lr=lr, precision=precision,
+        optimizer_8bit=optimizer_8bit,
+        max_epochs=max_epochs,
+        limit_train_batches=limit_train_batches,
+        limit_val_batches=limit_val_batches,
     )
     gc.collect()
     return (ldm, trainer)
