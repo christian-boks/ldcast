@@ -11,6 +11,14 @@ from .models.genforecast import analysis, unet
 from .models.diffusion import diffusion, plms
 
 
+_AMP_DTYPES = {
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+    "fp32": None,
+    None: None,
+}
+
+
 class Forecast:
     def __init__(
         self,
@@ -23,6 +31,7 @@ class Forecast:
         autoenc_time_ratio=4,
         autoenc_hidden_dim=32,
         verbose=True,
+        precision="bf16",
         R_min_value=0.1,
         R_zero_value=0.02,
         R_min_output=0.1,
@@ -56,6 +65,11 @@ class Forecast:
 
         # setup sampler
         self.sampler = plms.PLMSSampler(self.ldm)
+
+        # autocast (mixed-precision) inference config
+        self.amp_dtype = _AMP_DTYPES[precision]
+        self.use_autocast = (self.amp_dtype is not None) and \
+            (self.ldm.device.type == "cuda")
 
         gc.collect()
 
@@ -94,9 +108,15 @@ class Forecast:
         )
 
         # create LDM
-        ldm = diffusion.LatentDiffusion(denoiser, autoencoder_obs, 
+        ldm = diffusion.LatentDiffusion(denoiser, autoencoder_obs,
             context_encoder=analysis_net)
         ldm.load_state_dict(torch.load(self.ldm_weights_fn))
+
+        # install EMA weights once instead of swapping them in on every diffusion
+        # step (makes ema_scope a no-op during sampling); output is unchanged
+        if ldm.use_ema:
+            ldm.model_ema.copy_to(ldm.model)
+            ldm.use_ema = False
 
         return ldm
     
@@ -114,17 +134,22 @@ class Forecast:
         x = [[x, timesteps]]
 
         # run LDM sampler
-        with contextlib.redirect_stdout(None):
-            (s, intermediates) = self.sampler.sample(
-                num_diffusion_iters, 
-                x[0][0].shape[0],
-                gen_shape,
-                x,
-                progbar=self.verbose
-            )
+        amp = (torch.autocast("cuda", dtype=self.amp_dtype)
+               if self.use_autocast else contextlib.nullcontext())
+        with amp:
+            with contextlib.redirect_stdout(None):
+                (s, intermediates) = self.sampler.sample(
+                    num_diffusion_iters,
+                    x[0][0].shape[0],
+                    gen_shape,
+                    x,
+                    progbar=self.verbose
+                )
 
-        # postprocess outputs
-        y_pred = self.ldm.autoencoder.decode(s)
+            # postprocess outputs
+            y_pred = self.ldm.autoencoder.decode(s)
+
+        y_pred = y_pred.float()
         R_pred = self.inv_transform_precip(y_pred)
 
         return R_pred[0,...]
@@ -170,6 +195,7 @@ class ForecastDistributed:
         autoenc_time_ratio=4,
         autoenc_hidden_dim=32,
         verbose=True,
+        precision="bf16",
         R_min_value=0.1,
         R_zero_value=0.02,
         R_min_output=0.1,
@@ -206,7 +232,8 @@ class ForecastDistributed:
             "R_max_output": R_max_output,
             "log_R_mean": log_R_mean,
             "log_R_std": log_R_std,
-            "verbose": True
+            "verbose": True,
+            "precision": precision,
         }
         self.num_procs = max(1, torch.cuda.device_count())
         self.compute_procs = mp.spawn(

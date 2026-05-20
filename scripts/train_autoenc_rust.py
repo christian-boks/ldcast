@@ -19,7 +19,7 @@ from ldcast.models.autoenc import encoder, training
 def train(
     index_path=None,
     past_steps=4,
-    future_steps=12,
+    future_steps=8,
     height=256,
     width=256,
     full_frame=False,

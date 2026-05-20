@@ -42,6 +42,7 @@ class LatentDiffusion(pl.LightningModule):
         self.autoencoder = autoencoder.requires_grad_(False)
         self.conditional = (context_encoder is not None)
         self.context_encoder = context_encoder
+        self._cond_cache = None  # encoded conditioning, reused across sampling steps
         self.lr = lr
         self.lr_warmup = lr_warmup
         self.optimizer_8bit = optimizer_8bit
@@ -106,7 +107,11 @@ class LatentDiffusion(pl.LightningModule):
 
     def apply_model(self, x_noisy, t, cond=None, return_ids=False):
         if self.conditional:
-            cond = self.context_encoder(cond)
+            # The conditioning is constant across diffusion steps, so encode it
+            # once per sampling run and reuse it (keyed on the input identity).
+            if self._cond_cache is None or self._cond_cache[0] is not cond:
+                self._cond_cache = (cond, self.context_encoder(cond))
+            cond = self._cond_cache[1]
         with self.ema_scope():
             return self.model(x_noisy, t, context=cond)
 

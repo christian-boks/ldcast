@@ -222,7 +222,7 @@ def predict(
     out_dir: str = "../predictions",
     index_path: str | None = None,
     past_steps: int = 4,
-    future_steps: int = 12,
+    future_steps: int = 8,
     num_diffusion_iters: int = 50,
     frame_height: int = 1440,
     frame_width: int = 1856,

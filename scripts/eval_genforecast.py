@@ -69,15 +69,16 @@ def ldm_process(
         gen_shape = (32, 5) + (y.shape[-2]//4, y.shape[-1]//4)
         for member in range(ensemble_size):
             print(f"Compute process {idx} generating member {member+1}/{ensemble_size}")
-            with contextlib.redirect_stdout(None):
-                (s, intermediates) = sampler.sample(
-                    num_diffusion_iters, 
-                    batch_size,
-                    gen_shape,
-                    x,
-                    progbar=False
-                )
-            y_pred.append(ldm.autoencoder.decode(s))
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                with contextlib.redirect_stdout(None):
+                    (s, intermediates) = sampler.sample(
+                        num_diffusion_iters,
+                        batch_size,
+                        gen_shape,
+                        x,
+                        progbar=False
+                    )
+                y_pred.append(ldm.autoencoder.decode(s).float())
         
         y_pred = torch.stack(y_pred, dim=-1)
         y_pred = nested_to(y_pred, device='cpu')

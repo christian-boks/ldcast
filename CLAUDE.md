@@ -79,3 +79,6 @@ Shared building blocks are in `ldcast/models/blocks/`: `afno.py` (Adaptive Fouri
 - Checkpointing: both trainers keep the top-3 checkpoints by monitored metric (`val_rec_loss` for the autoencoder, `val_loss_ema` for the diffusion model) and early-stop with patience 6.
 - Config files in `config/` are sparse OmegaConf YAMLs that only set overrides; the 128×128 config is intentionally empty (defaults), the 256×256 config bumps `sample_shape`, `batch_size`, `lr`, and points `initial_weights` at the 128×128 checkpoint for staged training.
 - Autoencoder training has a known instability: loss can go to NaN. Resume from the latest checkpoint with `--ckpt_path=...` (README notes this).
+
+## Hardware
+The user has a RTX 5080 (Blackwell, 16 GB)

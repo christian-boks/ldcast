@@ -109,7 +109,7 @@ def run(
     genforecast_batch_size: int = 8,
     num_workers: int = 4,
     past_steps: int = 4,
-    future_steps: int = 12,
+    future_steps: int = 8,
     force_autoenc: bool = False,
     skip_autoenc: bool = False,
     precision: str = "bf16-mixed",

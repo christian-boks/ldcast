@@ -134,7 +134,7 @@ class RustRadarDataModule(pl.LightningDataModule):
         index_path: str,
         mode: str = "autoenc",
         past_steps: int = 4,
-        future_steps: int = 12,
+        future_steps: int = 8,
         height: int = 256,
         width: int = 256,
         full_frame: bool = False,

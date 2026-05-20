@@ -32,7 +32,7 @@ def setup_genforecast_training(
         filename="{epoch}-{val_loss_ema:.4f}",
         monitor="val_loss_ema",
         every_n_epochs=1,
-        save_top_k=3
+        save_top_k=1  # reduced from 3: each 670M-param ckpt is ~6 GB; 16 GB free disk
     )
     callbacks = [early_stopping, checkpoint]
 
@@ -42,6 +42,7 @@ def setup_genforecast_training(
         max_epochs=max_epochs,
         strategy=('ddp' if num_gpus > 1 else 'auto'),
         callbacks=callbacks,
+        gradient_clip_val=1.0,  # prevent early gradient explosion -> NaN loss
     )
     if precision is not None:
         trainer_kwargs["precision"] = precision

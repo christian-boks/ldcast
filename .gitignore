@@ -145,3 +145,4 @@ cython_debug/
 /figures
 /data/demo
 /models
+/predictions
