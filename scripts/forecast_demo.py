@@ -77,6 +77,7 @@ def forecast_demo(
     ldm_weights_fn="../models/genforecast/genforecast-radaronly-256x256-20step.pt",
     autoenc_weights_fn="../models/autoenc/autoenc-32-0.01.pt",
     num_diffusion_iters=50,
+    sampler="plms",
     out_dir="../figures/demo/",
     data_dir="../data/demo/20210622",
     t0=datetime(2021,6,22,18,35),
@@ -93,7 +94,8 @@ def forecast_demo(
     if ensemble_members == 1:
         fc = forecast.Forecast(
             ldm_weights_fn=ldm_weights_fn,
-            autoenc_weights_fn=autoenc_weights_fn
+            autoenc_weights_fn=autoenc_weights_fn,
+            sampler=sampler
         )
         R_pred = fc(
             R_past,
@@ -103,6 +105,7 @@ def forecast_demo(
         fc = forecast.ForecastDistributed(
             ldm_weights_fn=ldm_weights_fn,
             autoenc_weights_fn=autoenc_weights_fn,
+            sampler=sampler,
         )
         R_past = R_past.reshape((1,) + R_past.shape)
         R_pred = fc(

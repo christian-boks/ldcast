@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 from .features.transform import Antialiasing
 from .models.autoenc import autoenc, encoder
 from .models.genforecast import analysis, unet
-from .models.diffusion import diffusion, plms
+from .models.diffusion import diffusion, dpm_solver, plms, uni_pc
 
 
 _AMP_DTYPES = {
@@ -32,14 +32,17 @@ class Forecast:
         autoenc_hidden_dim=32,
         verbose=True,
         precision="bf16",
+        sampler="plms",
         R_min_value=0.1,
         R_zero_value=0.02,
         R_min_output=0.1,
         R_max_output=118.428,
         log_R_mean=-0.051,
         log_R_std=0.528,
+        scale_factor=1.0,
     ):
         self.ldm_weights_fn = ldm_weights_fn
+        self.scale_factor = scale_factor
         self.autoenc_weights_fn = autoenc_weights_fn
         self.verbose = verbose
         self.R_min_value = R_min_value
@@ -64,7 +67,16 @@ class Forecast:
                 self.ldm.to(device=f"cuda:{gpu}")
 
         # setup sampler
-        self.sampler = plms.PLMSSampler(self.ldm)
+        samplers = {
+            "plms": plms.PLMSSampler,
+            "dpmpp": dpm_solver.DPMSolverSampler,
+            "unipc": uni_pc.UniPCSampler,
+        }
+        if sampler not in samplers:
+            raise ValueError(
+                f"unknown sampler {sampler!r}; choose from {list(samplers)}"
+            )
+        self.sampler = samplers[sampler](self.ldm)
 
         # autocast (mixed-precision) inference config
         self.amp_dtype = _AMP_DTYPES[precision]
@@ -109,7 +121,7 @@ class Forecast:
 
         # create LDM
         ldm = diffusion.LatentDiffusion(denoiser, autoencoder_obs,
-            context_encoder=analysis_net)
+            context_encoder=analysis_net, scale_factor=self.scale_factor)
         ldm.load_state_dict(torch.load(self.ldm_weights_fn))
 
         # install EMA weights once instead of swapping them in on every diffusion
@@ -147,7 +159,7 @@ class Forecast:
                 )
 
             # postprocess outputs
-            y_pred = self.ldm.autoencoder.decode(s)
+            y_pred = self.ldm.autoencoder.decode(s / self.ldm.scale_factor)
 
         y_pred = y_pred.float()
         R_pred = self.inv_transform_precip(y_pred)
@@ -196,12 +208,14 @@ class ForecastDistributed:
         autoenc_hidden_dim=32,
         verbose=True,
         precision="bf16",
+        sampler="plms",
         R_min_value=0.1,
         R_zero_value=0.02,
         R_min_output=0.1,
         R_max_output=118.428,
         log_R_mean=-0.051,
         log_R_std=0.528,
+        scale_factor=1.0,
     ):
         self.verbose = verbose
         self.R_min_value = R_min_value
@@ -234,6 +248,8 @@ class ForecastDistributed:
             "log_R_std": log_R_std,
             "verbose": True,
             "precision": precision,
+            "sampler": sampler,
+            "scale_factor": scale_factor,
         }
         self.num_procs = max(1, torch.cuda.device_count())
         self.compute_procs = mp.spawn(

@@ -122,18 +122,22 @@ export DGMR_RADAR_ROOT=/path/to/radar_data        # YYYY/MM/DD/HH/MM_00Z_all.img
 export DGMR_RADAR_INDEX=/path/to/radar_data/index_128.txt   # CSV: timestamp,x,y[,weight]
 ```
 
+Alternatively, set `radar_root` / `index_path` in `config/train_rust.yaml` so you don't need the env vars at all (`index_path` is passed straight to the loader; `radar_root` is exported for the Rust loader, which only reads it from the env).
+
 ### Cadence and time-axis constraint
 
 The Rust loader serves frames at the dgmr-rs native 10-minute cadence. LDCast's autoencoder applies a temporal compression of 4, so `past_steps + future_steps` must be divisible by 4. The defaults are `past_steps=4, future_steps=12` (= 120 min lead time, latent time = 4); the only other clean options are 4 or 8 future frames.
 
 ### Train both stages
 
-One command runs the autoencoder, extracts its best `state_dict`, and trains the diffusion model on top:
+One command runs the autoencoder, extracts its best `state_dict`, and trains the diffusion model on top. Drive it from a config file so you don't have to pass a wall of flags (recommended):
 
 ```bash
 cd scripts
-uv run python train_rust.py
+uv run python train_rust.py --config=../config/train_rust.yaml
 ```
+
+`config/train_rust.yaml` ships with sane defaults for a **16 GB GPU (RTX 5080) at 128×128** — edit it in place, or override any field on the CLI (`--max_hours=10`, `--genforecast_batch_size=4`, …); CLI args win over the file. Without `--config`, the built-in defaults target a ~24 GB GPU.
 
 The index file passed in `DGMR_RADAR_INDEX` must list crops sized for the `--height`/`--width` you choose: `index_128.txt` for 128×128 (the verified smaller-GPU recipe below), `index_256.txt` for the 256×256 defaults. The two-column `index.txt` produced by dgmr-rs for full-frame training is not compatible — `parse_index` requires `timestamp,x,y[,weight]`.
 
@@ -147,20 +151,78 @@ uv run python train_rust.py --force_autoenc=True       # always retrain stage 1
 
 If `--autoenc_dir` (default `../models/autoenc_rust`) already contains checkpoints you'll be prompted whether to re-train stage 1; pressing Enter skips it and goes straight to diffusion.
 
-GPU memory: the defaults (256×256, `--autoenc_batch_size=16`, `--genforecast_batch_size=8`) assume a ~24 GB GPU. Both stages default to `--precision=bf16-mixed`. Stage 2's 670 M-param UNet plus an EMA shadow copy and fp32 AdamW state alone is ~13.5 GB, so on a 16 GB card you also need 8-bit AdamW to fit. Install the optional bitsandbytes extra and pass `--optimizer_8bit=True`:
+GPU memory: the built-in defaults (256×256, `--autoenc_batch_size=16`, `--genforecast_batch_size=8`) assume a ~24 GB GPU. Both stages default to `--precision=bf16-mixed`. Stage 2's 670 M-param UNet plus an EMA shadow copy and fp32 AdamW state alone is ~13.5 GB, so on a 16 GB card you also need 8-bit AdamW. Install the optional bitsandbytes extra:
 
 ```bash
-uv sync --extra low-vram                              # installs bitsandbytes
-uv run python train_rust.py \
-    --height=128 --width=128 \
-    --autoenc_batch_size=16 \
-    --genforecast_batch_size=2 \
-    --optimizer_8bit=True                             # 16 GB recipe (verified on RTX 5080)
+uv sync --extra low-vram      # installs bitsandbytes (needed for optimizer_8bit)
 ```
 
-Use `--autoenc_batch_size=N` / `--genforecast_batch_size=N` to scale to your hardware; pass `--precision=32` to opt out of mixed precision.
+The shipped `config/train_rust.yaml` already encodes the **16 GB recipe**: 128×128, `optimizer_8bit: true`, `genforecast_batch_size: 8` (~14.5 GB; drop to 4 or 2 if you OOM — batch 8 is ~2× faster than 2 at 128×128 and still fits). Use `--autoenc_batch_size=N` / `--genforecast_batch_size=N` to scale; `--precision=32` opts out of mixed precision.
 
 The two underlying scripts (`train_autoenc_rust.py` and `train_genforecast_rust.py`) can still be invoked directly when you need finer control — `train_rust.py` is just a thin orchestrator. All scripts split the index file 90/10 deterministically (seed 42, matching dgmr-rs) into train and validation, and use the `weight` column of the index as a `WeightedRandomSampler` on the training loader (disable with `--use_weighted_sampler=False`).
+
+### Configuration reference
+
+`config/train_rust.yaml` exposes every orchestrator option; the most useful:
+
+| field | default | meaning |
+|---|---|---|
+| `height` / `width` | 128 | crop size (÷32; index must match) |
+| `autoenc_batch_size` / `genforecast_batch_size` | 16 / 8 | per-stage batch (16 GB) |
+| `optimizer_8bit` | true | 8-bit AdamW (required for the diffusion stage at 128 on 16 GB) |
+| `num_workers` | 8 | dataloader workers (the autoencoder is data-bound; ~8 is the sweet spot) |
+| `limit_train_batches` | 2000 | steps per "epoch" (≈8 min); `null` = full ~17 h epoch |
+| `limit_val_batches` | 50 | val batches per check (the full val set is ≈38 min) |
+| `early_stopping_patience` | 20 | epochs without val improvement before stopping; `0` disables |
+| `max_hours` | null | wall-clock budget **per stage** (for time-boxed chunks) |
+| `sample_every_n_epochs` | 1 | TensorBoard preview cadence; `0` disables |
+| `skip_autoenc` / `force_autoenc` | false | skip / force stage 1 |
+| `genforecast_ckpt_path` | null | resume the diffusion stage from this checkpoint |
+
+The defaults cap the "epoch" at 2000 train / 50 val batches because a full epoch over the 2.3 M-crop 128 index is ~17 h on a 16 GB card — far too long when validation, checkpoints, previews and early-stopping all fire per epoch. Set both limits to `null` for true full epochs.
+
+### Monitoring training (TensorBoard)
+
+Both stages log to TensorBoard under `<model_dir>/tb` (no extra install — `tensorboard` is a dependency):
+
+```bash
+tensorboard --logdir ../models/genforecast_rust   # or ../models/autoenc_rust
+```
+
+- **Autoencoder:** `val_rec_loss` curve + an **input-vs-reconstruction** image grid (`val/reconstruction`).
+- **Diffusion:** `val_loss_ema` curve + a **ground-truth-vs-forecast** image grid (`val/forecast`).
+
+For a diffusion model the loss number barely reflects sample quality, so watch the images; they refresh every `sample_every_n_epochs`. (The diffusion forecast preview samples a 128² centre crop under live weights to fit alongside training; both previews are wrapped so a sampling hiccup never crashes the run.)
+
+### Resuming and time-boxed (iterative) training
+
+Checkpoints are written every epoch, and `save_last=True` keeps a `last.ckpt` that always reflects the most recent epoch — the right thing to resume from (the best-named ckpt is kept for deployment). Resuming restores optimizer/LR/EMA/epoch — a true continue, not a weights-only reload.
+
+So you can train in chunks — run for N hours, stop, continue later, repeat:
+
+```bash
+# first run: autoencoder (runs to convergence), then a diffusion chunk.
+# --max_hours caps EACH stage; the autoencoder normally early-stops well before it.
+uv run python train_rust.py --config=../config/train_rust.yaml --max_hours=10
+
+# continue the diffusion stage for another chunk (skips stage 1, resumes from last.ckpt)
+uv run python train_rust.py --config=../config/train_rust.yaml \
+    --skip_autoenc=True --max_hours=10 \
+    --genforecast_ckpt_path=../models/genforecast_rust/last.ckpt
+```
+
+Each chunk is just more gradient steps → a monotonically better model. With the short default epochs a stopped run loses ≤ one epoch. To stop *only* on the time budget (not early-stopping), set `early_stopping_patience: 0`.
+
+### Throughput and epoch time
+
+Measured on a 16 GB RTX 5080 at 128×128 (varies with hardware/dataset):
+
+| stage | throughput | full epoch (≈2.08 M train crops) |
+|---|---|---|
+| autoencoder (batch 16) | ~100 samples/s (data-bound) | ~5.8 h |
+| diffusion (batch 8, 8-bit Adam) | ~34 samples/s (compute-bound) | ~17 h |
+
+This is why the config caps `limit_train_batches`. Note that training time scales with **gradient steps**, not the size of the crop pool — training on fewer crops doesn't make a run finish sooner, it only reduces data variety (and raises overfitting risk).
 
 ### Full-frame inference (16 GB GPU, no seams)
 

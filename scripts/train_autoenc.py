@@ -65,14 +65,16 @@ def setup_data(
 
 
 def setup_model(
-    model_dir=None
+    model_dir=None,
+    sample_every_n_epochs=1
 ):
     enc = encoder.SimpleConvEncoder()
     dec = encoder.SimpleConvDecoder()
     (autoencoder, trainer) = training.setup_autoenc_training(
         encoder=enc,
         decoder=dec,
-        model_dir=model_dir
+        model_dir=model_dir,
+        sample_every_n_epochs=sample_every_n_epochs
     )
     gc.collect()
     return (autoencoder, trainer)
@@ -85,7 +87,8 @@ def train(
     num_timesteps=8,
     chunks_file="../data/split_chunks.pkl.gz",
     model_dir=None,
-    ckpt_path=None
+    ckpt_path=None,
+    sample_every_n_epochs=1
 ):
     print("Loading data...")
     datamodule = setup_data(
@@ -94,7 +97,8 @@ def train(
     )
 
     print("Setting up model...")
-    (model, trainer) = setup_model(model_dir=model_dir)
+    (model, trainer) = setup_model(model_dir=model_dir,
+        sample_every_n_epochs=sample_every_n_epochs)
 
     print("Starting training...")
     trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_path)

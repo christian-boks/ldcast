@@ -224,6 +224,8 @@ def predict(
     past_steps: int = 4,
     future_steps: int = 8,
     num_diffusion_iters: int = 50,
+    sampler: str = "plms",                # "plms" | "dpmpp" | "unipc"
+    scale_factor: float = 1.0,            # must match training scale_factor (not stored in the ckpt)
     frame_height: int = 1440,
     frame_width: int = 1856,
     precision: str = "bf16-mixed",        # "bf16-mixed" | "fp16-mixed" | "fp32"
@@ -296,6 +298,8 @@ def predict(
         autoenc_weights_fn=autoenc_sd,
         past_timesteps=past_steps,
         future_timesteps=future_steps,
+        sampler=sampler,
+        scale_factor=scale_factor,
     )
 
     # Cache the analysis-cascade context across PLMS steps.
@@ -386,7 +390,7 @@ def predict(
         print("torch.compile() on UNet (first call pays ~30s)")
         fc.ldm.model = torch.compile(fc.ldm.model, dynamic=False)
 
-    print(f"Sampling ({num_diffusion_iters} PLMS steps, precision={precision})...")
+    print(f"Sampling ({num_diffusion_iters} {sampler} steps, precision={precision})...")
     autocast_ctx = (
         torch.autocast(device_type="cuda", dtype=autocast_dtype)
         if autocast_dtype is not None and torch.cuda.is_available()

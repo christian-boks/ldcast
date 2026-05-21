@@ -28,6 +28,7 @@ dependencies = [
     "scipy",
     "torch",
     "tqdm",
+    "tensorboard>=2.11.2",
 ]
 
 [project.optional-dependencies]

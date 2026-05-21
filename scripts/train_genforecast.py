@@ -24,6 +24,11 @@ def setup_model(
     max_epochs=1000,
     limit_train_batches=None,
     limit_val_batches=None,
+    scale_factor=1.0,
+    gradient_clip_val=1.0,
+    sample_every_n_epochs=1,
+    max_hours=None,
+    early_stopping_patience=6,
 ):
     enc = encoder.SimpleConvEncoder()
     dec = encoder.SimpleConvDecoder()    
@@ -74,6 +79,11 @@ def setup_model(
         max_epochs=max_epochs,
         limit_train_batches=limit_train_batches,
         limit_val_batches=limit_val_batches,
+        scale_factor=scale_factor,
+        gradient_clip_val=gradient_clip_val,
+        sample_every_n_epochs=sample_every_n_epochs,
+        max_hours=max_hours,
+        early_stopping_patience=early_stopping_patience,
     )
     gc.collect()
     return (ldm, trainer)
@@ -90,7 +100,10 @@ def train(
     initial_weights=None,
     strict_weights=True,
     model_dir=None,
-    lr=1e-4
+    lr=1e-4,
+    scale_factor=1.0,
+    gradient_clip_val=1.0,
+    sample_every_n_epochs=1,
 ):
     if sampler is None:
         sampler_file = None
@@ -115,7 +128,10 @@ def train(
         use_obs=use_obs,
         use_nwp=use_nwp,
         model_dir=model_dir,
-        lr=lr
+        lr=lr,
+        scale_factor=scale_factor,
+        gradient_clip_val=gradient_clip_val,
+        sample_every_n_epochs=sample_every_n_epochs,
     )
     if initial_weights is not None:
         print(f"Loading weights from {initial_weights}...")

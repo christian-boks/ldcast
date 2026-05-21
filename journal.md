@@ -1,5 +1,195 @@
 # LDCast Engineering Journal
 
+## 2026-05-21 — Config-driven, resumable, time-boxed rust training
+
+Makes the two-stage rust training drivable from a YAML and survivable across runs (needed because a
+full epoch over the 2.3M-crop 128 index is ~17 h — see the throughput entry).
+
+### Changes
+- **`save_last=True`** on both stages' `ModelCheckpoint` → a `last.ckpt` always reflects the most
+  recent epoch (the best-named ckpt is still kept for deployment). The right target for `--ckpt_path`.
+- **`max_hours`** (both stages) → `Trainer(max_time=timedelta(hours=...))` for time-boxed chunks: run
+  N hours, stop, re-run with `--ckpt_path=.../last.ckpt` to continue. Lightning resume restores
+  optimizer/LR/EMA/epoch — a true continue, not a weights-only restart.
+- **`early_stopping_patience`** (both stages) exposed; `0` disables EarlyStopping. Default stays 6, but
+  the config sets 20 because the recommended short epochs shrink the patience window (it counts epochs).
+- **`train_rust.py` now takes `--config=<yaml>`** — it was the only training script without it (the
+  per-stage scripts already had the OmegaConf `main()` pattern). CLI args still override the file. It
+  also forwards `--autoenc_ckpt_path` / `--genforecast_ckpt_path`, so resume works through the
+  orchestrator + same config (e.g. `--skip_autoenc=True --genforecast_ckpt_path=.../last.ckpt`).
+- **`config/train_rust.yaml`** — sane 16 GB / 128² defaults: batch 16/8, `optimizer_8bit`, bf16-mixed,
+  `num_workers` 8, `limit_train_batches` 2000 + `limit_val_batches` 50 (≈8 min epochs so
+  val/preview/checkpoint/early-stop fire at a usable cadence vs the ~17 h full epoch), patience 20.
+- **Data location in the config** (`radar_root` / `index_path`): `index_path` is forwarded to the
+  stage scripts as `--index_path` (no env round-trip); `radar_root` is exported as `DGMR_RADAR_ROOT`
+  because the dgmr-py Rust loader reads the archive root from the env (`std::env::var`) and exposes
+  no way to pass it. Env vars are needed only when the config omits a value.
+
+### Why cap limit_val_batches too
+With `limit_train_batches` making ~8 min epochs, the full val set (~10 % ≈ 230K crops ≈ 38 min) would
+dominate. Capping to 50 batches keeps validation ~12 s — a small consistent subset, fine for progress
+tracking and checkpoint selection.
+
+Verified: config → correct subprocess commands (CLI override respected); `save_last` / Timer /
+EarlyStopping toggles behave as expected.
+
+## 2026-05-21 — Training observability: TensorBoard sample + reconstruction logging
+
+Added a dgmr-rs-style "watch the forecast during training" view. Before: scalar-only (Lightning's
+default CSVLogger; `train_loss` / `val_loss` / `val_loss_ema`), no sample images — useless for a
+diffusion model whose eps-MSE barely moves.
+
+### Changes
+- **`ldcast/models/genforecast/monitor.py`** — `SamplePredictionLogger` (`pl.Callback`). Every
+  `sample_every_n_epochs`, samples one fixed val case through the PLMS sampler and logs a
+  ground-truth-vs-prediction precip image grid (`val/forecast`) to TensorBoard.
+- **`training.py`** — Trainer now uses `TensorBoardLogger(save_dir=model_dir, name="tb")` (so the
+  existing scalars stream live too) and adds the callback when `sample_every_n_epochs > 0`. Threaded
+  `sample_every_n_epochs` (default 1) through `setup_model` + both train scripts. Added `tensorboard` dep.
+- **`ldcast/models/autoenc/monitor.py`** — `ReconstructionLogger` (stage-1 symmetry): every
+  `sample_every_n_epochs`, logs an input-vs-`decode(encode(x))` grid (`val/reconstruction`) + the
+  autoenc scalar curves. Simpler than the forecast logger (no sampler / EMA / crop; the autoenc is
+  tiny, no memory pressure). Threaded through `train_autoenc_rust.py` / `train_autoenc.py`. Note:
+  reconstruction is the autoencoder *alone* — it can't forecast (that needs stage 2) — but its
+  fidelity is the ceiling on stage 2, so it's the right stage-1 progress signal.
+- Watch with `tensorboard --logdir <model_dir>`.
+
+### Memory (16 GB): the callback must not OOM a tight run
+Training already holds model+EMA+optimizer (~10.8 GB), so a full-res EMA sample OOMs (peak 16.1 GB).
+Two defaults keep the preview at ~12.2 GB (fits at any training resolution):
+- **live weights** (`use_ema=False`): skips the +2.7 GB EMA-store backup; the current model's
+  forecast is at least as informative as the lagging EMA early on.
+- **center-crop to 128²** (`sample_hw=128`): bounds activations; a no-op when training ≤128².
+
+Wrapped in try/except so a sampling OOM is logged and skipped, never crashing training. Verified
+end-to-end (`trainer.fit`): `val/forecast` images logged once per epoch + scalar curves.
+
+## 2026-05-21 — Diffusion training speed: profiled, fused AdamW (+16–27%)
+
+Profiled rust diffusion training (670M UNet) on the 16 GB 5080 to find what to optimize.
+
+### Bottleneck: compute-bound, memory-constrained
+The dataloader delivers ~95–103 samples/s (4 workers); the GPU processes only 7–22 samples/s — so
+data loading is **not** the limit, compute is. Per-step breakdown (128², batch 4, bf16, 180 ms
+baseline): fwd 53 ms (encode 11 + context-encoder 8 + UNet 34) + backward ~67 + **optimizer 60**.
+
+Memory is the other wall: 256²/batch 2 peaks at 15.8 GB *with EMA freed*; real training (EMA on,
++2.7 GB) barely fits batch 2. EMA shadow (2.7 GB) + fp32 AdamW state (5.4 GB) dominate.
+
+### Change: fused AdamW (`diffusion.py` `configure_optimizers`, default on CUDA)
+The optimizer step was a third of the step time — default `AdamW` (foreach) over 671M params.
+`fused=True` cuts it **60 → 23 ms** (single fused kernel, numerically identical):
+
+| config | baseline | fused AdamW | speedup |
+|---|---|---|---|
+| 128², batch 4 | 180 ms/step (22 sps) | 142 ms/step (28 sps) | **+27%** |
+| 256², batch 2 | 290 ms/step (6.9 sps) | 251 ms/step (8.0 sps) | **+16%** |
+
+Optimizer cost is fixed (param-count bound), so the relative win is larger at the small batches
+forced by 16 GB. No quality impact. (Autoenc training left alone — tiny params, already ~11 min.)
+
+**Caveat (fixed 2026-05-21):** the fused optimizer is incompatible with Lightning's *automatic*
+gradient clipping ("does not allow ... performs unscaling internally") — and since
+`gradient_clip_val=1.0` is the default, this crashed `trainer.fit` at step 0 (only caught once a
+real fit was run end-to-end, not the manual-loop timing). Fix: clip manually in
+`LatentDiffusion.on_before_optimizer_step` (`clip_grad_norm_`, runs after backward / before step)
+and removed `gradient_clip_val` from the Trainer. Same clip value, fused preserved.
+
+### Tested, didn't help / deferred
+- **cudnn.benchmark**: ≈ noise — not conv-bound.
+- **TF32** (`set_float32_matmul_precision("high")`): no change — confirms the inference-side finding
+  (ops already bf16; the fp32 AFNO FFT isn't a TF32 matmul).
+- **8-bit AdamW + larger batch** (existing `--optimizer_8bit`): frees ~4 GB → fits batch 4–6 at 256²,
+  7.5 → 9.1 → 9.7 sps (per-sample 133 → 103 ms; GPU underutilized at small batch). +14–29%, but
+  changes numerics and EMA still caps the batch. Path to more speed: 8-bit Adam + CPU/periodic EMA
+  (free the 2.7 GB shadow) → larger batch. Not done (numerics/quality tradeoff).
+
+## 2026-05-21 — Diffusion training: scale_factor tested (doesn't help), two monitor fixes
+
+Investigated the training items flagged below (futures #2, #3) plus a validation-loop bug found
+while reading the code.
+
+### Fixes (kept)
+- **`val_loss_ema` logged the wrong tensor** (`diffusion.py` `validation_step`): it computed
+  `loss_ema` under EMA weights, then logged the *non-EMA* `loss` into `val_loss_ema`. The checkpoint
+  monitor, early-stopping, and the LR scheduler all key on `val_loss_ema` → all three were tracking
+  the raw training weights, not the EMA weights used at inference, and the EMA validation forward was
+  computed and thrown away. One-word fix (`loss` → `loss_ema`).
+- **`check_finite=False` → `True`** (`training.py` EarlyStopping, future #3): a NaN-diverged run now
+  stops instead of wasting hours. Extra-justified by the spike data below.
+- **`gradient_clip_val` made configurable** (`training.py` + train scripts; default 1.0 = unchanged),
+  so the clip can be tuned/disabled for experiments.
+
+### scale_factor (future #2): implemented, measured, A/B-tested — does NOT help
+Wired a `scale_factor` knob through `LatentDiffusion` (encode ×s) and every latent-decode site
+(`forecast.py`, `eval_genforecast.py`, ÷s) plus the train/predict CLIs. Default 1.0 = exact no-op;
+not stored in the ckpt, so train and inference must pass the same value. **Kept default-off** as
+infrastructure.
+
+Measured the rust-autoenc diffusion latent: **std ≈ 0.46, mean ≈ -0.04** — already in the benign
+[-1,1]-image range (~0.5) that plain DDPM trains on un-rescaled. So unit-variance means *amplifying*
+by 1/0.46 ≈ 2.18.
+
+Controlled A/B (128×128, batch 4, EMA freed, **no clip**, 300 identical fresh batches, seed-matched):
+
+| scale_factor | NaN | max grad_norm | spikes(>5) | loss[last 50] |
+|---|---|---|---|---|
+| 1.00 (off)     | none | 43       | 101 | 0.576 |
+| 2.18 (unit var)| none | **3818** | 56  | 0.708 |
+
+Amplifying to unit variance made the worst gradient spike ~88× larger (loss hit 37 at step 54, a
+hair from divergence) and **slowed convergence**. The latent is already well-scaled; scale_factor=2.18
+is counterproductive. The hypothesis that scale_factor "removes the need for the gradient_clip
+band-aid" is **not supported** — keep the clip: it is load-bearing (both runs throw frequent large
+unclipped spikes that would eventually NaN over a full run). Left `scale_factor=1.0` everywhere.
+
+(Caveat: bf16, 128×128, batch 4, 300 steps, single seed — directional, not a full-quality verdict.
+256×256/batch 8 OOMs a manual training loop on 16 GB; EMA shadow weights + fp32 AdamW state dominate.)
+
+## 2026-05-20 — DPM-Solver++ / UniPC fast samplers
+
+Implements future-improvement #1 below. Adds two training-free ODE samplers as drop-in
+alternatives to PLMS, selectable via a `sampler=` knob, to cut inference time by taking fewer
+diffusion steps — the dominant cost, since each step is one 670M-param UNet forward including an
+FP32 AFNO FFT (`unet.py` → `afno.py`) that BF16 cannot accelerate. The conditioning cascade is
+already cached (one-time), so step count is the only big remaining lever.
+
+### Changes
+- **New `ldcast/models/diffusion/dpm_solver.py`** — DPM-Solver / DPM-Solver++ (Lu et al.) vendored
+  from the UniPC repo's Stable-Diffusion integration, plus a `DPMSolverSampler` adapter mirroring
+  `PLMSSampler.sample`.
+- **New `ldcast/models/diffusion/uni_pc.py`** — UniPC (Zhao et al.) class + `UniPCSampler` adapter;
+  shares `NoiseScheduleVP`/`model_wrapper`/`expand_dims` with dpm_solver.py (imported, not
+  duplicated). One fix vs upstream: the hardcoded `bkchw` einsums in `multistep_uni_pc_bh_update`
+  generalized to `bk...` ellipsis for LDCast's 5D (B,C,T,H,W) video latents (upstream assumed 4D
+  images; the unreachable `vary_update` path is left as-is).
+- **`sampler=` knob** threaded through `forecast.Forecast`/`ForecastDistributed`,
+  `eval_genforecast.py`, `forecast_demo.py`, `predict_rust.py` — `"plms"` | `"dpmpp"` | `"unipc"`.
+  Default stays `"plms"` until visually confirmed.
+- Why it's a drop-in: LDCast is eps-parameterized on a linear discrete schedule (`alphas_cumprod`),
+  with no latent scale_factor and no classifier-free guidance — exactly what these solvers expect.
+  BF16 autocast still wraps the sampler call, so the speedups compound. **Not output-exact** (changes
+  the sample for a given seed) — validated by A/B, not bit-equality.
+
+### Verification (released demo model, 352×448, bf16; same seed; vs plms-50)
+| run | corr | mean-abs | time | speedup |
+|---|---|---|---|---|
+| plms-50 (baseline) | 1.0000 | 0.0000 | 7.97 s | 1.00× |
+| dpmpp-50 (sanity) | 0.9954 | 0.0245 | 8.04 s | 0.99× |
+| unipc-50 (sanity) | 0.9956 | 0.0237 | 8.04 s | 0.99× |
+| dpmpp-20 | 0.9919 | 0.0401 | 3.35 s | 2.38× |
+| unipc-15 | 0.9829 | 0.0343 | 2.59 s | 3.08× |
+
+dpmpp/unipc at 50 steps reproduce plms-50 (corr ≈0.995) → the schedule + continuous→discrete
+timestep conversion is correct. At reduced steps quality holds (corr ≥0.98) for 2.4–3.1×.
+Full-frame (1440×1856, rust fs=8, bf16): plms-50 57.5 s → **dpmpp-20 23.9 s (2.40×)**.
+`ForecastDistributed` (ensemble) path also verified end-to-end.
+
+### Recommended use
+`--sampler=dpmpp --num_diffusion_iters=20` (robust ~2.4×) or `--sampler=unipc
+--num_diffusion_iters=15` (~3×). Possible follow-up: A/B CRPS/FSS via `eval_genforecast.py` +
+`metrics.py`, then flip the default sampler once happy with the demo PNGs.
+
 ## 2026-05-20 — Inference speed-ups + dgmr-rs full-frame pipeline
 
 Hardware: RTX 5080 (Blackwell, 16 GB). Goal: make LDCast inference faster on a 16 GB GPU,
@@ -56,15 +246,15 @@ which is baked into the weights — train and infer must use the same value; val
 
 ### Future improvements (prioritized)
 
-1. **Faster sampler (DPM-Solver++ / UniPC).** Biggest remaining inference win. The bottleneck is AFNO's
-   fp32 FFT × 50 PLMS steps; a higher-order solver typically matches 50-step PLMS quality at ~15–25 steps
-   (~2× fewer network evals). Plain DDIM is *not* worth it — same per-step cost as PLMS, and PLMS holds
-   quality at fewer steps (established this session).
-2. **Latent scale factor.** `LatentDiffusion` has no latent normalization (cf. Stable Diffusion's 0.18215).
-   A configurable `scale_factor` would improve training stability — likely the proper fix that removes the
-   need for the `gradient_clip_val` band-aid and allows a higher LR.
-3. **NaN-safe training.** `EarlyStopping(check_finite=False)` + a val metric that can be NaN means a diverged
-   run wastes hours. Set `check_finite=True` (and/or guard NaN batches) so training stops on NaN.
+1. **DONE — Faster sampler (DPM-Solver++ / UniPC).** Implemented; see the 2026-05-20 entry above.
+   ~2.4× (dpmpp-20) / ~3× (unipc-15) at corr ≥0.98 vs plms-50, no retraining. Plain DDIM was *not*
+   worth it — same per-step cost as PLMS. Follow-up: CRPS/FSS A/B and flipping the default sampler.
+2. **TESTED, doesn't help — Latent scale factor.** Implemented as a configurable `scale_factor` (default
+   1.0, off). Measured latent std ≈0.46 (already benign); scale_factor=2.18 (unit variance) *worsened*
+   the max gradient spike (43→3818) and slowed convergence vs no scaling. The `gradient_clip` is
+   load-bearing and not removable. Knob kept default-off. See the 2026-05-21 entry.
+3. **DONE — NaN-safe training.** `EarlyStopping(check_finite=True)` set, so a NaN-diverged run stops
+   instead of wasting hours. See the 2026-05-21 entry.
 4. **True memory reduction.** BF16 autocast didn't cut VRAM. To fit larger domains / `future_steps=20` /
    more ensemble members on 16 GB, convert the UNet to bf16 *weights* in the `Forecast` path (predict_rust
    already does this for full-frame) and generalize its memory-efficient decode.

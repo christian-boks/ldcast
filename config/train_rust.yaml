@@ -1,0 +1,63 @@
+# LDCast two-stage rust training — config for scripts/train_rust.py.
+# Sane defaults for a 16 GB GPU (RTX 5080) at 128x128 crops.
+#
+#   cd scripts
+#   uv run python train_rust.py --config=../config/train_rust.yaml
+#
+# Any field can still be overridden on the CLI, e.g.:
+#   uv run python train_rust.py --config=../config/train_rust.yaml --max_hours=10
+
+# --- radar data location ---
+# Where the radar archive and crop index live — set these and you don't need any env vars in your
+# shell. index_path is passed straight to the loader; radar_root is required by the Rust loader,
+# which only reads it from DGMR_RADAR_ROOT, so the orchestrator exports it for you. index_path must
+# match height/width below (index_128.txt for 128, index_256.txt for 256). null on either falls
+# back to the matching env var. NOTE: machine-specific paths.
+radar_root: /opt/radar_data
+index_path: /opt/radar_data/index_128.txt
+
+# --- where checkpoints go ---
+autoenc_dir: ../models/autoenc_rust
+genforecast_dir: ../models/genforecast_rust
+
+# --- crop size & lead time (128 = verified 16 GB recipe) ---
+height: 128
+width: 128
+past_steps: 4
+future_steps: 8           # 60 min lead; (past_steps + future_steps) must be divisible by 4
+
+# --- data loading ---
+num_workers: 8            # autoencoder is data-bound; ~8 is the sweet spot
+
+# --- batch sizes & precision (16 GB) ---
+autoenc_batch_size: 16
+genforecast_batch_size: 8    # ~14.5 GB with 8-bit Adam; drop to 4 or 2 if you OOM
+optimizer_8bit: true         # REQUIRED at 128: the 670M UNet + EMA + AdamW OOMs without it
+precision: bf16-mixed
+
+# --- epoch length, validation & stopping ---
+# The full ~2.3M-crop epoch is ~17 h, so cap the "epoch" to a usable cadence: validation, the
+# TensorBoard preview, checkpoints and early-stopping all fire per epoch. Set both limits to
+# null for true full epochs.
+limit_train_batches: 2000    # ~8 min (diffusion) / ~5 min (autoenc) per epoch
+limit_val_batches: 50        # keep validation short (the full val set is ~38 min); a small,
+                             # consistent subset — fine for tracking progress & picking checkpoints
+max_epochs: 1000             # ceiling; early-stopping normally ends it first
+max_hours: null              # wall-clock budget per run; set e.g. 10 for time-boxed chunks, then
+                             # re-run pointing --ckpt_path at the saved last.ckpt to continue
+early_stopping_patience: 20  # epochs without val improvement before stopping (raised for the short
+                             # epochs above); set 0 to disable and stop only via max_hours
+sample_every_n_epochs: 1     # TensorBoard forecast/reconstruction preview cadence (0 disables)
+
+# --- stage control ---
+force_autoenc: false         # always retrain stage 1 (autoencoder)
+skip_autoenc: false          # skip stage 1, reuse existing autoencoder checkpoints
+
+# --- resume (time-boxed iterative training) ---
+# Leave null for a fresh run. To continue a stopped run, skip stage 1 and point at the saved
+# last.ckpt — Lightning restores optimizer/LR/EMA/epoch (a true continue):
+#   uv run python train_rust.py --config=../config/train_rust.yaml \
+#       --skip_autoenc=True --max_hours=10 \
+#       --genforecast_ckpt_path=../models/genforecast_rust/last.ckpt
+autoenc_ckpt_path: null
+genforecast_ckpt_path: null

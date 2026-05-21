@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 
 from fire import Fire
+from omegaconf import OmegaConf
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 
@@ -42,10 +43,13 @@ def _check_bridge():
         )
 
 
-def _check_env():
-    missing = [v for v in ("DGMR_RADAR_ROOT", "DGMR_RADAR_INDEX") if v not in os.environ]
-    if missing:
-        sys.exit("Missing env var(s): " + ", ".join(missing))
+def _check_env(radar_root, index_path):
+    # radar_root reaches the Rust loader only via DGMR_RADAR_ROOT (it has no API to pass it);
+    # index_path is forwarded straight to the stage scripts. Require each only if not in the config.
+    if radar_root is None and "DGMR_RADAR_ROOT" not in os.environ:
+        sys.exit("Set radar_root in config/train_rust.yaml or export DGMR_RADAR_ROOT")
+    if index_path is None and "DGMR_RADAR_INDEX" not in os.environ:
+        sys.exit("Set index_path in config/train_rust.yaml or export DGMR_RADAR_INDEX")
 
 
 _VAL_LOSS_RE = re.compile(r"val_rec_loss=(\d+\.\d+)")
@@ -101,6 +105,8 @@ def _run(cmd: list[str], stage_name: str) -> None:
 
 
 def run(
+    radar_root: str | None = None,
+    index_path: str | None = None,
     autoenc_dir: str = "../models/autoenc_rust",
     genforecast_dir: str = "../models/genforecast_rust",
     height: int = 256,
@@ -117,13 +123,23 @@ def run(
     max_epochs: int = 1000,
     limit_train_batches: int | None = None,
     limit_val_batches: int | None = None,
+    max_hours: float | None = None,
+    early_stopping_patience: int = 6,
+    sample_every_n_epochs: int = 1,
+    autoenc_ckpt_path: str | None = None,
+    genforecast_ckpt_path: str | None = None,
 ):
     """Train autoencoder then diffusion model in one shot."""
     if force_autoenc and skip_autoenc:
         sys.exit("--force_autoenc and --skip_autoenc are mutually exclusive")
 
     _check_bridge()
-    _check_env()
+    _check_env(radar_root, index_path)
+    # radar_root reaches the Rust loader only via DGMR_RADAR_ROOT; export it from the config so the
+    # spawned stage subprocesses (which inherit os.environ) pick it up. index_path is forwarded
+    # directly as --index_path below — no env round-trip.
+    if radar_root is not None:
+        os.environ["DGMR_RADAR_ROOT"] = radar_root
 
     autoenc_dir_p = (SCRIPTS_DIR / autoenc_dir).resolve()
 
@@ -151,11 +167,19 @@ def run(
             f"--future_steps={future_steps}",
             f"--precision={precision}",
             f"--max_epochs={max_epochs}",
+            f"--sample_every_n_epochs={sample_every_n_epochs}",
+            f"--early_stopping_patience={early_stopping_patience}",
         ]
         if limit_train_batches is not None:
             cmd.append(f"--limit_train_batches={limit_train_batches}")
         if limit_val_batches is not None:
             cmd.append(f"--limit_val_batches={limit_val_batches}")
+        if max_hours is not None:
+            cmd.append(f"--max_hours={max_hours}")
+        if autoenc_ckpt_path is not None:
+            cmd.append(f"--ckpt_path={autoenc_ckpt_path}")
+        if index_path is not None:
+            cmd.append(f"--index_path={index_path}")
         _run(cmd, stage_name="Stage 1: autoencoder")
     else:
         print(f"Skipping stage 1 (autoencoder); using existing checkpoints in {autoenc_dir_p}")
@@ -183,15 +207,29 @@ def run(
         f"--precision={precision}",
         f"--optimizer_8bit={optimizer_8bit}",
         f"--max_epochs={max_epochs}",
+        f"--sample_every_n_epochs={sample_every_n_epochs}",
+        f"--early_stopping_patience={early_stopping_patience}",
     ]
     if limit_train_batches is not None:
         cmd.append(f"--limit_train_batches={limit_train_batches}")
     if limit_val_batches is not None:
         cmd.append(f"--limit_val_batches={limit_val_batches}")
+    if max_hours is not None:
+        cmd.append(f"--max_hours={max_hours}")
+    if genforecast_ckpt_path is not None:
+        cmd.append(f"--ckpt_path={genforecast_ckpt_path}")
+    if index_path is not None:
+        cmd.append(f"--index_path={index_path}")
     _run(cmd, stage_name="Stage 2: diffusion model")
 
     print("\nAll stages complete.")
 
 
+def main(config=None, **kwargs):
+    cfg = OmegaConf.load(config) if config else {}
+    cfg.update(kwargs)
+    run(**cfg)
+
+
 if __name__ == "__main__":
-    Fire(run)
+    Fire(main)

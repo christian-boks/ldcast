@@ -10,7 +10,7 @@ import torch.multiprocessing as mp
 from omegaconf import OmegaConf
 
 from ldcast.features.io import save_batch
-from ldcast.models.diffusion import plms
+from ldcast.models.diffusion import dpm_solver, plms, uni_pc
 
 import eval_data
 import train_genforecast
@@ -38,8 +38,10 @@ def ldm_process(
     ensemble_size=32,
     weights_fn="../models/genforecast/genforecast-radaronly-256x256-20step.pt",
     num_diffusion_iters=50,
+    sampler="plms",
+    scale_factor=1.0,
 ):
-    (ldm, trainer) = train_genforecast.setup_model()
+    (ldm, trainer) = train_genforecast.setup_model(scale_factor=scale_factor)
     ldm.to(device=f"cuda:{idx}")
 
     def load_weights(fn):
@@ -51,7 +53,14 @@ def ldm_process(
     if not many_weights:
         load_weights(weights_fn)
 
-    sampler = plms.PLMSSampler(ldm)
+    samplers = {
+        "plms": plms.PLMSSampler,
+        "dpmpp": dpm_solver.DPMSolverSampler,
+        "unipc": uni_pc.UniPCSampler,
+    }
+    if sampler not in samplers:
+        raise ValueError(f"unknown sampler {sampler!r}; choose from {list(samplers)}")
+    sampler = samplers[sampler](ldm)
     print(f"LDM ready at {idx}")
 
     while (data := input_queue.get()) is not None:
@@ -78,7 +87,7 @@ def ldm_process(
                         x,
                         progbar=False
                     )
-                y_pred.append(ldm.autoencoder.decode(s).float())
+                y_pred.append(ldm.autoencoder.decode(s / ldm.scale_factor).float())
         
         y_pred = torch.stack(y_pred, dim=-1)
         y_pred = nested_to(y_pred, device='cpu')
@@ -97,6 +106,8 @@ def create_evaluation_ensemble(
     ensemble_size=32,
     weights_fn="../models/genforecast/genforecast-radaronly-256x256-20step.pt",
     num_diffusion_iters=50,
+    sampler="plms",
+    scale_factor=1.0,
     dataset_id="testset"
 ):
     data_iter = eval_data.get_data_iter(
@@ -114,7 +125,7 @@ def create_evaluation_ensemble(
         ldm_process, 
         args=(
             compute_queue, io_queue,
-            ensemble_size, weights_fn, num_diffusion_iters
+            ensemble_size, weights_fn, num_diffusion_iters, sampler, scale_factor
         ),
         nprocs=num_gpus,
         join=False

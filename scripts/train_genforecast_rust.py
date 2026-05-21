@@ -48,6 +48,11 @@ def train(
     max_epochs=1000,
     limit_train_batches=None,
     limit_val_batches=None,
+    scale_factor=1.0,
+    gradient_clip_val=1.0,
+    sample_every_n_epochs=1,
+    max_hours=None,
+    early_stopping_patience=6,
 ):
     if index_path is None:
         index_path = os.environ["DGMR_RADAR_INDEX"]
@@ -85,6 +90,11 @@ def train(
         max_epochs=max_epochs,
         limit_train_batches=limit_train_batches,
         limit_val_batches=limit_val_batches,
+        scale_factor=scale_factor,
+        gradient_clip_val=gradient_clip_val,
+        sample_every_n_epochs=sample_every_n_epochs,
+        max_hours=max_hours,
+        early_stopping_patience=early_stopping_patience,
     )
     gc.collect()
 
