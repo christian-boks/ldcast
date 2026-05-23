@@ -1,6 +1,121 @@
 # LDCast Engineering Journal
 
+## 2026-05-23 — Diffusion under-forecasts; stop letting eps-MSE (`val_loss_ema`) control training
+
+Trained the rust autoencoder to convergence and ran a first real overnight diffusion run. The
+`val_loss_ema` curve looked converged (best 0.0955 @ epoch 44, ran to ~epoch 65), but an ensemble
+read showed the forecasts are badly under-covered — because the eps-MSE was driving early-stopping,
+the LR schedule, and checkpoint selection, none of which it's fit for.
+
+### The finding: forecasts dry out; the loss hid it
+A 16-member ensemble from the best ckpt (epoch 44) on a *persistent widespread-rain* val case (past
+61→73 % wet, truth 77–84 %) collapses coverage to ~20 % (+1) → ~2 % (+8) — it erases existing rain
+and is **worse than naive persistence** (the input alone is ~73 %). Confirmed real, not an artifact:
+- The ensemble *mean* is just as sparse (not a single-sample fluke).
+- The training-time `val/forecast` monitor (separate code path) shows the same dry-out.
+- Not the autoencoder — the rust AE reconstructs heavy rain faithfully (val_rec_loss ~0.061; verified
+  by rendering an input-vs-recon grid on a 63 %-wet case).
+- The case is fair (persistent rain, not unforecastable initiation).
+Root cause: undertrained diffusion (~130 K steps) **plus** `val_loss_ema` (an eps-prediction MSE)
+being treated as a quality/convergence signal. It plateaus early and barely tracks sample quality
+(already noted 2026-05-21), yet it controlled three things it shouldn't.
+
+### Stop using `val_loss_ema` as a control signal
+- **Constant LR** (`diffusion.py` `configure_optimizers`): removed `ReduceLROnPlateau(monitor=
+  "val_loss_ema")`. On the eps-loss plateau it had decayed the LR to **6.1e-9** (verified in
+  `last.ckpt`) while forecasts were still poor — so "more training" learned nothing. Now constant
+  `lr`; the linear warmup in `optimizer_step` is preserved.
+- **No early-stop** (`config/train_rust.yaml`): `early_stopping_patience` 20 → 0. The eps-loss must
+  not stop training; judge progress by the `val/forecast` images and offline ensemble metrics.
+- **No "best" checkpoint** (`genforecast/training.py`): `save_top_k` 1 → 0, keep only `last.ckpt`.
+  The eps-MSE "best" is meaningless for diffusion, and each ckpt is 6.7 GB on a near-full disk.
+  Removed the now-dead `monitor`/`filename`. Inference / resume use `last.ckpt`.
+- `limit_train_batches` 2000 → 8000 (now only sets val/preview/checkpoint cadence).
+- Deleted the two dead 6.7 GB epoch-44 checkpoints (18 → 31 GB free). Checkpointing had silently
+  frozen at epoch 44 (`last.ckpt` stuck at step 90000 while TB ran to 130000) — disk too full to
+  write a new 6.7 GB ckpt, which likely also ended the run.
+
+### Autoencoder NaN no longer poisons stage 2
+A NaN'd autoencoder early-stops *gracefully* (exit 0), and `train_rust.py` only checks the subprocess
+exit code — so it was building the diffusion stage on a broken/2-epoch autoencoder.
+- `autoenc/training.py`: added `gradient_clip_val=1.0` to the Trainer (plain AdamW, so Lightning's
+  built-in clip works; mirrors the diffusion stage). Tames the bf16 KL-VAE blow-up.
+- `train_autoenc_rust.py`: after `fit`, `sys.exit(...)` if the final `val_rec_loss` is non-finite, so
+  the orchestrator's exit-code check aborts before stage 2. Verified: a clean short run exits 0 (a
+  finite metric doesn't false-trip).
+
+### TensorBoard preview was always blank (both stages)
+The recon/forecast loggers cached the **first** val case, which is bone-dry, and `plot_precip_image`
+masks <0.1 mm/h to white → an all-white grid every epoch.
+- `autoenc/monitor.py`: pick the **wettest crop in the batch**.
+- `genforecast/monitor.py`: scan up to 8 batches, keep the **wettest-future** case (batch 4 + dry
+  leading val entries → one batch isn't enough).
+
+### `resume`: continue-or-fresh (resolves the 2026-05-21 footgun)
+`train_rust.py` `_last_ckpt` (errored when missing) → `_resume_ckpt` (path or `None`). `resume: true`
+now **continues from `last.ckpt` if present, else starts fresh**; `resume: false` always restarts.
+One set-and-forget `resume: true` survives the stop/restart cycles of power-window training. Updated
+docstring, config comment, README. (Implemented as a redefinition of `true` rather than a third
+`auto` value.)
+
+### Misc
+- **README**: the `tensorboard --logdir ../models/...` command now shows `cd scripts` first — that
+  relative path only resolves from `scripts/`, so launching elsewhere gave "No dashboards are active".
+- Silenced torch's pytree `LeafSpec` deprecation in both training modules (third-party, benign; was
+  spamming every run).
+- New **`/analyze`** Claude Code skill (`.claude/skills/analyze/`): summarizes the active TB run —
+  stability/NaN, primary-metric whole-run + recent-slope trend + epochs-since-best, train-loss bins,
+  checkpoints. For diffusion it flags `val_loss_ema` as a divergence detector, not a quality verdict.
+
+### Next
+- Re-run diffusion fresh (`stages: diffusion`, `resume: true`, no ckpt yet → fresh) and watch
+  `val/forecast` coverage at +4/+8, not the loss. If coverage stays low after much more training,
+  it's a recipe issue (conditioning strength / rain-weighted loss), not just undertraining.
+
+## 2026-05-21 — Rust diffusion OOMs at batch 8 on 16 GB; config-driven stages/resume
+
+### batch 8 doesn't fit (corrected the config default)
+The `genforecast_batch_size: 8` default was wrong for 16 GB: it came from a *throughput* benchmark
+that had deleted the EMA store to fit, and was never run as a real training step — so it OOM'd at
+runtime. Verified on a clean GPU: diffusion at 128² with 8-bit AdamW **OOMs at the first optimizer
+step at batch 8** (peak 15837 / 16303 MiB, in the stock AFNO einsum) and **fits at batch 4** (peak
+15239 MiB, full train+val+sample loop). The OOM is inherent to the 670 M UNet + grads + 8-bit Adam +
+the fp32 EMA copy (~2.7 GB, present since the initial commit) — not from any recent change (`afno.py`
+/`unet.py` untouched in 3 years; the only uncommitted file was the config). Default is now batch 4.
+Measured batch-4 throughput ~20 samples/s (~4.9 it/s) → ~29 h full epoch; throughput entry updated.
+
+### stages + resume replace the skip/force/ckpt_path flags
+The earlier interface (`skip_autoenc`/`force_autoenc` + `--autoenc_ckpt_path`/`--genforecast_ckpt_path`
++ an interactive "re-train?" prompt) was clunky and asymmetric — stage-1 resume needed the
+`force_autoenc` dance plus an explicit ckpt path that was *silently ignored* whenever stage 1 was
+skipped. Replaced with two config knobs in `train_rust.py`:
+- `stages: both | autoenc | diffusion` — which stage(s) to run (diffusion-only = the old skip_autoenc;
+  autoenc-only is new: extend the autoencoder without running diffusion).
+- `resume: false | true` — restart from scratch vs continue each run stage from its `<dir>/last.ckpt`.
+No prompt; the config declares intent. Verified all combos build the right subprocess commands and that
+missing-`last.ckpt` / invalid-`stages` exit cleanly. Supersedes the flag list in the entry below.
+
+### train_rust.py loads the config by default
+`main()` falls back to `config/train_rust.yaml` (resolved from the script dir) when no `--config` is
+given, so the whole command is `uv run python train_rust.py`. `--config=<other.yaml>` overrides; CLI
+kwargs still win over the file. Verified: no-arg run loads the shipped config, CLI overrides apply,
+explicit `--config` still works.
+
+### Open / next (NOT implemented — pick up here)
+- **`resume` is a footgun.** Currently a manual bool: `false` = restart, `true` = continue (errors if
+  no `last.ckpt`). But for the diffusion stage you almost always want to continue — you'd only *not*
+  resume on the first run (no ckpt yet), after retraining the autoencoder / changing `future_steps`/dims
+  (stale or shape-incompatible ckpt), or to scrap a diverged run. So the default `false` means you must
+  remember to flip it to `true` after run #1 or you silently restart from scratch. Proposed: make
+  `resume: auto` the default → continue if `last.ckpt` exists else start fresh; `false` forces a restart;
+  `true` requires a ckpt. **Awaiting go-ahead — not built yet.**
+- **To kick off the real diffusion run** (autoencoder trained, diffusion never checkpointed):
+  `uv run python train_rust.py --stages=diffusion` (resume stays false; nothing to resume yet).
+
 ## 2026-05-21 — Config-driven, resumable, time-boxed rust training
+
+_Superseded in parts by the entry above: batch 4 (not 8); `stages`/`resume` replace the
+`skip_autoenc`/`force_autoenc`/`*_ckpt_path` flags; the config loads by default._
 
 Makes the two-stage rust training drivable from a YAML and survivable across runs (needed because a
 full epoch over the 2.3M-crop 128 index is ~17 h — see the throughput entry).

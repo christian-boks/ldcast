@@ -7,7 +7,9 @@ Usage (from this directory):
             --model_dir=../models/autoenc_rust
 """
 import gc
+import math
 import os
+import sys
 
 from fire import Fire
 from omegaconf import OmegaConf
@@ -75,6 +77,16 @@ def train(
 
     print("Starting training...")
     trainer.fit(autoencoder, datamodule=dm, ckpt_path=ckpt_path)
+
+    # A NaN/Inf in val_rec_loss makes Lightning's EarlyStopping stop *gracefully* (exit 0),
+    # which train_rust.py would mistake for success and then build the diffusion stage on a
+    # broken/undertrained autoencoder. Fail loudly so the orchestrator aborts before stage 2.
+    val = trainer.callback_metrics.get("val_rec_loss")
+    if val is None or not math.isfinite(float(val)):
+        sys.exit(
+            f"Autoencoder training ended on a non-finite val_rec_loss ({val}); "
+            "treating as failure. Investigate, then resume with resume=true."
+        )
 
 
 def main(config=None, **kwargs):

@@ -1,3 +1,4 @@
+import warnings
 from datetime import timedelta
 
 import pytorch_lightning as pl
@@ -6,6 +7,10 @@ import torch
 
 from . import autoenc
 from . import monitor
+
+# torch's pytree LeafSpec deprecation, surfaced via PL's _pytree shim on recent torch.
+# Third-party and benign; silence it so it doesn't spam every training run's logs.
+warnings.filterwarnings("ignore", message=r".*LeafSpec.*deprecated.*")
 
 
 def setup_autoenc_training(
@@ -50,6 +55,9 @@ def setup_autoenc_training(
         strategy=('ddp' if num_gpus > 1 else 'auto'),
         callbacks=callbacks,
         logger=TensorBoardLogger(save_dir=model_dir, name="tb"),
+        gradient_clip_val=1.0,  # plain AdamW -> Lightning's built-in clip works; matches
+                                # the diffusion stage's grad-norm clip and tames the
+                                # bf16 KL-VAE NaN blowup
     )
     if precision is not None:
         trainer_kwargs["precision"] = precision

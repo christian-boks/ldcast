@@ -43,13 +43,24 @@ class SamplePredictionLogger(pl.Callback):
         (h, w) = (min(self.sample_hw, H), min(self.sample_hw, W))
         return t[..., (H - h) // 2:(H - h) // 2 + h, (W - w) // 2:(W - w) // 2 + w]
 
-    def _fixed_case(self, trainer):
+    def _fixed_case(self, trainer, scan_batches=8):
         if self._case is None:
-            (x, y) = next(iter(trainer.datamodule.val_dataloader()))
-            # crop only the spatial frame tensor; leave the timestep vector
-            x = [[self._crop(past[:1]).clone(), t_past[:1].clone()]
-                 for (past, t_past) in x]
-            self._case = (x, self._crop(y[:1]).clone())
+            # The leading val crops are often bone-dry (-> a blank grid). Scan a few
+            # batches and keep the case with the wettest future, so the truth/
+            # prediction grid actually shows rain. (batch_size can be small, e.g. 4,
+            # so one batch isn't enough to escape the dry leading entries.)
+            best = None  # (wetness, x_pairs, y) for the wettest future seen so far
+            for bi, (x, y) in enumerate(trainer.datamodule.val_dataloader()):
+                wet = y.flatten(1).mean(1)  # per-sample mean rain in the future
+                i = int(wet.argmax())
+                if best is None or wet[i] > best[0]:
+                    # crop only the spatial frame tensor; leave the timestep vector
+                    xi = [[self._crop(past[i:i + 1]).clone(), t_past[i:i + 1].clone()]
+                          for (past, t_past) in x]
+                    best = (float(wet[i]), xi, self._crop(y[i:i + 1]).clone())
+                if bi + 1 >= scan_batches:
+                    break
+            self._case = (best[1], best[2])
         return self._case
 
     @torch.no_grad()

@@ -208,17 +208,12 @@ class LatentDiffusion(pl.LightningModule):
             optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr,
                 betas=(0.5, 0.9), weight_decay=1e-3,
                 fused=torch.cuda.is_available())
-        reduce_lr = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, patience=3, factor=0.25
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": reduce_lr,
-                "monitor": "val_loss_ema",
-                "frequency": 1,
-            },
-        }
+        # Constant LR (after the warmup in optimizer_step). The previous
+        # ReduceLROnPlateau was keyed to val_loss_ema -- the eps-prediction MSE,
+        # which plateaus early and does not track sample quality -- so it decayed
+        # the LR to ~0 while forecasts were still poor. Keep the LR fixed and judge
+        # progress from the val/forecast images / offline metrics instead.
+        return optimizer
 
     def optimizer_step(
         self,

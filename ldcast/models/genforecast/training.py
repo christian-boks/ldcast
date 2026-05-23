@@ -1,3 +1,4 @@
+import warnings
 from datetime import timedelta
 
 import pytorch_lightning as pl
@@ -6,6 +7,10 @@ import torch
 
 from ..diffusion import diffusion
 from . import monitor
+
+# torch's pytree LeafSpec deprecation, surfaced via PL's _pytree shim on recent torch.
+# Third-party and benign; silence it so it doesn't spam every training run's logs.
+warnings.filterwarnings("ignore", message=r".*LeafSpec.*deprecated.*")
 
 
 def setup_genforecast_training(
@@ -36,11 +41,16 @@ def setup_genforecast_training(
 
     checkpoint = pl.callbacks.ModelCheckpoint(
         dirpath=model_dir,
-        filename="{epoch}-{val_loss_ema:.4f}",
-        monitor="val_loss_ema",
         every_n_epochs=1,
-        save_top_k=1,  # reduced from 3: each 670M-param ckpt is ~6 GB; 16 GB free disk
-        save_last=True,  # also keep last.ckpt -> clean resume via --ckpt_path
+        save_top_k=1,  # one rolling ckpt per epoch (~6.7 GB). NOTE: save_top_k=0 +
+                       # save_last=True is a SILENT NO-OP in Lightning 2.x -- last.ckpt
+                       # is only written when a top-k ckpt is also saved that same step,
+                       # so save_top_k=0 means no checkpoint is ever written mid-run.
+                       # monitor=None keeps just the latest (a "best" by val_loss_ema,
+                       # an eps-MSE, doesn't track forecast quality anyway); resume picks
+                       # the newest ckpt.
+        monitor=None,
+        save_last=False,
     )
     callbacks = [checkpoint]
     if early_stopping_patience and early_stopping_patience > 0:

@@ -26,7 +26,10 @@ class ReconstructionLogger(pl.Callback):
             (x, _y) = next(iter(trainer.datamodule.val_dataloader()))
             while isinstance(x, (list, tuple)):  # unwrap [(frames, t_rel)] -> frames
                 x = x[0]
-            self._x = x[:1].clone()
+            # the first val crop is often bone-dry (-> an all-white plot); pick the
+            # wettest sample in the batch so the grid actually shows rain.
+            wettest = int(x.flatten(1).mean(1).argmax())
+            self._x = x[wettest:wettest + 1].clone()
         return self._x
 
     @torch.no_grad()

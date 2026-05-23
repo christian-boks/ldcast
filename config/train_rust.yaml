@@ -1,11 +1,13 @@
 # LDCast two-stage rust training — config for scripts/train_rust.py.
 # Sane defaults for a 16 GB GPU (RTX 5080) at 128x128 crops.
+# train_rust.py loads THIS file by default, so the whole command is just:
 #
 #   cd scripts
-#   uv run python train_rust.py --config=../config/train_rust.yaml
+#   uv run python train_rust.py
 #
 # Any field can still be overridden on the CLI, e.g.:
-#   uv run python train_rust.py --config=../config/train_rust.yaml --max_hours=10
+#   uv run python train_rust.py --max_hours=10
+# Use --config=<other.yaml> to load a different config instead of this one.
 
 # --- radar data location ---
 # Where the radar archive and crop index live — set these and you don't need any env vars in your
@@ -31,7 +33,7 @@ num_workers: 8            # autoencoder is data-bound; ~8 is the sweet spot
 
 # --- batch sizes & precision (16 GB) ---
 autoenc_batch_size: 16
-genforecast_batch_size: 8    # ~14.5 GB with 8-bit Adam; drop to 4 or 2 if you OOM
+genforecast_batch_size: 4    # verified: peaks ~15.2 GB at 128 (incl. EMA + sample preview); batch 8 OOMs (>16 GB)
 optimizer_8bit: true         # REQUIRED at 128: the 670M UNet + EMA + AdamW OOMs without it
 precision: bf16-mixed
 
@@ -39,25 +41,31 @@ precision: bf16-mixed
 # The full ~2.3M-crop epoch is ~17 h, so cap the "epoch" to a usable cadence: validation, the
 # TensorBoard preview, checkpoints and early-stopping all fire per epoch. Set both limits to
 # null for true full epochs.
-limit_train_batches: 2000    # ~8 min (diffusion) / ~5 min (autoenc) per epoch
+limit_train_batches: 8000    # ~32 min/epoch (diffusion); sets validation/preview/checkpoint cadence
 limit_val_batches: 50        # keep validation short (the full val set is ~38 min); a small,
                              # consistent subset — fine for tracking progress & picking checkpoints
 max_epochs: 1000             # ceiling; early-stopping normally ends it first
 max_hours: null              # wall-clock budget per run; set e.g. 10 for time-boxed chunks, then
                              # re-run pointing --ckpt_path at the saved last.ckpt to continue
-early_stopping_patience: 20  # epochs without val improvement before stopping (raised for the short
-                             # epochs above); set 0 to disable and stop only via max_hours
+early_stopping_patience: 0   # disabled: val_loss_ema (eps-MSE) poorly reflects diffusion sample
+                             # quality, so don't let it stop training; stop manually or via max_hours
 sample_every_n_epochs: 1     # TensorBoard forecast/reconstruction preview cadence (0 disables)
 
-# --- stage control ---
-force_autoenc: false         # always retrain stage 1 (autoencoder)
-skip_autoenc: false          # skip stage 1, reuse existing autoencoder checkpoints
-
-# --- resume (time-boxed iterative training) ---
-# Leave null for a fresh run. To continue a stopped run, skip stage 1 and point at the saved
-# last.ckpt — Lightning restores optimizer/LR/EMA/epoch (a true continue):
-#   uv run python train_rust.py --config=../config/train_rust.yaml \
-#       --skip_autoenc=True --max_hours=10 \
-#       --genforecast_ckpt_path=../models/genforecast_rust/last.ckpt
-autoenc_ckpt_path: null
-genforecast_ckpt_path: null
+# --- workflow control (this is all you edit to choose what a run does) ---
+# stages: which stage(s) this run executes.
+#   both      = stage 1 (autoencoder) then stage 2 (diffusion)
+#   autoenc   = stage 1 only — train/extend the autoencoder, stop before diffusion
+#   diffusion = stage 2 only — reuse the existing autoencoder, train the diffusion model
+stages: diffusion
+# resume: false = always start the executed stage(s) from scratch (force restart).
+#         true  = continue from <dir>/last.ckpt if it exists (Lightning restores
+#                 epoch/optimizer/LR/EMA), else start fresh — so you can leave this on
+#                 `true` and it resumes automatically across stop/restart cycles.
+resume: true
+#
+# Recipes — edit the two lines above, then just run `train_rust.py`:
+#   restart everything from scratch : stages=both       resume=false
+#   resume the diffusion model      : stages=diffusion  resume=true
+#   resume / extend the autoencoder : stages=autoenc    resume=true
+#   train diffusion fresh (ae done) : stages=diffusion  resume=false
+#   time-boxed chunks               : set max_hours above + resume=true, re-run to continue

@@ -3,17 +3,26 @@
 Runs the autoencoder, extracts its best state_dict, then runs the diffusion
 model — in two separate subprocesses so the GPU is fully reset between stages.
 
-Usage (from this directory):
+Everything is driven by the config; you shouldn't need CLI flags. The shipped
+config/train_rust.yaml is loaded by default, so this is the whole command:
 
-    DGMR_RADAR_ROOT=/path/to/radar_data DGMR_RADAR_INDEX=/path/to/index.txt \\
-        uv run python train_rust.py
-    uv run python train_rust.py --height=128 --width=128  # smaller crops
-    uv run python train_rust.py --skip_autoenc=True        # only stage 2
-    uv run python train_rust.py --force_autoenc=True       # retrain stage 1
+    uv run python train_rust.py
 
-If autoencoder checkpoints already exist in --autoenc_dir you'll be prompted
-whether to re-train; default (Enter or 'N') skips stage 1 and goes straight
-to diffusion using the best existing checkpoint.
+Two config knobs control the workflow:
+
+    stages: both | autoenc | diffusion   # which stage(s) to run
+    resume: false | true                  # false=restart; true=continue last.ckpt if any, else fresh
+
+  both      = stage 1 (autoencoder) then stage 2 (diffusion)
+  autoenc   = stage 1 only (extend the autoencoder, stop before diffusion)
+  diffusion = stage 2 only (reuse the existing autoencoder)
+
+  resume=false always starts the executed stage(s) from scratch; resume=true
+  continues each from <stage_dir>/last.ckpt when present (Lightning restores
+  epoch/optimizer/LR/EMA) and starts fresh when it's missing -- so a single
+  resume=true survives stop/restart cycles.
+
+Any field can still be overridden on the CLI, e.g. --stages=diffusion --resume=True.
 """
 from __future__ import annotations
 
@@ -28,6 +37,7 @@ from fire import Fire
 from omegaconf import OmegaConf
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG = SCRIPTS_DIR.parent / "config" / "train_rust.yaml"
 
 
 def _check_bridge():
@@ -82,18 +92,22 @@ def _extract_state_dict(ckpt_path: Path, out_path: Path) -> Path:
     return out_path
 
 
-def _existing_ckpts(autoenc_dir: Path) -> list[str]:
-    return sorted(glob.glob(str(autoenc_dir / "*.ckpt")))
+def _resume_ckpt(stage_dir: Path) -> str | None:
+    """Path to the checkpoint to resume from, or None to start fresh.
 
+    The autoencoder stage keeps a last.ckpt; the diffusion stage keeps a single
+    rolling 'epoch=..-step=..ckpt' (save_top_k=1, no last.ckpt), so prefer
+    last.ckpt when present and otherwise fall back to the newest *.ckpt.
 
-def _prompt_retrain(autoenc_dir: Path) -> bool:
-    """Return True to re-train, False to skip stage 1. Default (Enter/N) = skip."""
-    prompt = f"Autoenc checkpoint(s) found in {autoenc_dir}. Re-train? [y/N] "
-    try:
-        answer = input(prompt).strip().lower()
-    except EOFError:
-        answer = ""
-    return answer in ("y", "yes")
+    resume=true means "continue if there's a checkpoint, else start fresh", so a
+    first run (no checkpoint yet) starts from scratch instead of erroring. One
+    resume=true setting then does the right thing across stop/restart cycles
+    (e.g. time-boxed training that stops and resumes each run)."""
+    last = stage_dir / "last.ckpt"
+    if last.exists():
+        return str(last)
+    ckpts = glob.glob(str(stage_dir / "*.ckpt"))
+    return max(ckpts, key=os.path.getmtime) if ckpts else None
 
 
 def _run(cmd: list[str], stage_name: str) -> None:
@@ -116,8 +130,8 @@ def run(
     num_workers: int = 4,
     past_steps: int = 4,
     future_steps: int = 8,
-    force_autoenc: bool = False,
-    skip_autoenc: bool = False,
+    stages: str = "both",
+    resume: bool = False,
     precision: str = "bf16-mixed",
     optimizer_8bit: bool = False,
     max_epochs: int = 1000,
@@ -126,12 +140,11 @@ def run(
     max_hours: float | None = None,
     early_stopping_patience: int = 6,
     sample_every_n_epochs: int = 1,
-    autoenc_ckpt_path: str | None = None,
-    genforecast_ckpt_path: str | None = None,
 ):
-    """Train autoencoder then diffusion model in one shot."""
-    if force_autoenc and skip_autoenc:
-        sys.exit("--force_autoenc and --skip_autoenc are mutually exclusive")
+    """Run the autoencoder and/or diffusion stages per the config (see module docstring)."""
+    valid_stages = ("both", "autoenc", "diffusion")
+    if stages not in valid_stages:
+        sys.exit(f"stages must be one of {valid_stages}, got {stages!r}")
 
     _check_bridge()
     _check_env(radar_root, index_path)
@@ -142,16 +155,9 @@ def run(
         os.environ["DGMR_RADAR_ROOT"] = radar_root
 
     autoenc_dir_p = (SCRIPTS_DIR / autoenc_dir).resolve()
-
-    # Stage 1 decision
-    if skip_autoenc:
-        do_autoenc = False
-    elif force_autoenc:
-        do_autoenc = True
-    elif _existing_ckpts(autoenc_dir_p):
-        do_autoenc = _prompt_retrain(autoenc_dir_p)
-    else:
-        do_autoenc = True
+    genforecast_dir_p = (SCRIPTS_DIR / genforecast_dir).resolve()
+    do_autoenc = stages in ("both", "autoenc")
+    do_genforecast = stages in ("both", "diffusion")
 
     # Stage 1: autoencoder
     if do_autoenc:
@@ -176,56 +182,69 @@ def run(
             cmd.append(f"--limit_val_batches={limit_val_batches}")
         if max_hours is not None:
             cmd.append(f"--max_hours={max_hours}")
-        if autoenc_ckpt_path is not None:
-            cmd.append(f"--ckpt_path={autoenc_ckpt_path}")
         if index_path is not None:
             cmd.append(f"--index_path={index_path}")
+        ckpt = _resume_ckpt(autoenc_dir_p) if resume else None
+        if ckpt:
+            cmd.append(f"--ckpt_path={ckpt}")
+        elif resume:
+            print(f"NOTE: resume=true but no last.ckpt in {autoenc_dir_p} yet — starting stage 1 fresh.")
+        elif list(autoenc_dir_p.glob("*.ckpt")):
+            print(f"NOTE: restarting stage 1 from scratch into non-empty {autoenc_dir_p}; old "
+                  "checkpoints are kept and could be picked as 'best'. Clear the dir for a clean restart.")
         _run(cmd, stage_name="Stage 1: autoencoder")
-    else:
-        print(f"Skipping stage 1 (autoencoder); using existing checkpoints in {autoenc_dir_p}")
 
-    # Extract state_dict from the best autoenc checkpoint
-    print("\n=== Extracting autoencoder state_dict ===")
-    best_ckpt = _best_autoenc_ckpt(autoenc_dir_p)
-    state_dict_path = autoenc_dir_p / "state_dict.pt"
-    _extract_state_dict(best_ckpt, state_dict_path)
-    print(f"Picked {best_ckpt.name} -> wrote {state_dict_path}")
+    # Stage 2: diffusion (needs the trained autoencoder's weights as input)
+    if do_genforecast:
+        print("\n=== Extracting autoencoder state_dict ===")
+        best_ckpt = _best_autoenc_ckpt(autoenc_dir_p)
+        state_dict_path = autoenc_dir_p / "state_dict.pt"
+        _extract_state_dict(best_ckpt, state_dict_path)
+        print(f"Picked {best_ckpt.name} -> wrote {state_dict_path}")
 
-    # Stage 2: diffusion. autoenc_weights_fn must be a path resolvable from scripts/.
-    autoenc_weights_arg = os.path.relpath(state_dict_path, SCRIPTS_DIR)
-    cmd = [
-        sys.executable,
-        "train_genforecast_rust.py",
-        f"--autoenc_weights_fn={autoenc_weights_arg}",
-        f"--model_dir={genforecast_dir}",
-        f"--height={height}",
-        f"--width={width}",
-        f"--batch_size={genforecast_batch_size}",
-        f"--num_workers={num_workers}",
-        f"--past_steps={past_steps}",
-        f"--future_steps={future_steps}",
-        f"--precision={precision}",
-        f"--optimizer_8bit={optimizer_8bit}",
-        f"--max_epochs={max_epochs}",
-        f"--sample_every_n_epochs={sample_every_n_epochs}",
-        f"--early_stopping_patience={early_stopping_patience}",
-    ]
-    if limit_train_batches is not None:
-        cmd.append(f"--limit_train_batches={limit_train_batches}")
-    if limit_val_batches is not None:
-        cmd.append(f"--limit_val_batches={limit_val_batches}")
-    if max_hours is not None:
-        cmd.append(f"--max_hours={max_hours}")
-    if genforecast_ckpt_path is not None:
-        cmd.append(f"--ckpt_path={genforecast_ckpt_path}")
-    if index_path is not None:
-        cmd.append(f"--index_path={index_path}")
-    _run(cmd, stage_name="Stage 2: diffusion model")
+        # autoenc_weights_fn must be a path resolvable from scripts/.
+        autoenc_weights_arg = os.path.relpath(state_dict_path, SCRIPTS_DIR)
+        cmd = [
+            sys.executable,
+            "train_genforecast_rust.py",
+            f"--autoenc_weights_fn={autoenc_weights_arg}",
+            f"--model_dir={genforecast_dir}",
+            f"--height={height}",
+            f"--width={width}",
+            f"--batch_size={genforecast_batch_size}",
+            f"--num_workers={num_workers}",
+            f"--past_steps={past_steps}",
+            f"--future_steps={future_steps}",
+            f"--precision={precision}",
+            f"--optimizer_8bit={optimizer_8bit}",
+            f"--max_epochs={max_epochs}",
+            f"--sample_every_n_epochs={sample_every_n_epochs}",
+            f"--early_stopping_patience={early_stopping_patience}",
+        ]
+        if limit_train_batches is not None:
+            cmd.append(f"--limit_train_batches={limit_train_batches}")
+        if limit_val_batches is not None:
+            cmd.append(f"--limit_val_batches={limit_val_batches}")
+        if max_hours is not None:
+            cmd.append(f"--max_hours={max_hours}")
+        if index_path is not None:
+            cmd.append(f"--index_path={index_path}")
+        ckpt = _resume_ckpt(genforecast_dir_p) if resume else None
+        if ckpt:
+            cmd.append(f"--ckpt_path={ckpt}")
+        elif resume:
+            print(f"NOTE: resume=true but no checkpoint in {genforecast_dir_p} yet — starting stage 2 fresh.")
+        _run(cmd, stage_name="Stage 2: diffusion model")
 
-    print("\nAll stages complete.")
+    print("\nAll requested stages complete.")
 
 
 def main(config=None, **kwargs):
+    # Default to the shipped config so plain `train_rust.py` works; --config=<path> overrides.
+    if config is None and DEFAULT_CONFIG.exists():
+        config = str(DEFAULT_CONFIG)
+    if config:
+        print(f"Loading config: {config}")
     cfg = OmegaConf.load(config) if config else {}
     cfg.update(kwargs)
     run(**cfg)

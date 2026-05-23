@@ -134,22 +134,23 @@ One command runs the autoencoder, extracts its best `state_dict`, and trains the
 
 ```bash
 cd scripts
-uv run python train_rust.py --config=../config/train_rust.yaml
+uv run python train_rust.py
 ```
 
-`config/train_rust.yaml` ships with sane defaults for a **16 GB GPU (RTX 5080) at 128×128** — edit it in place, or override any field on the CLI (`--max_hours=10`, `--genforecast_batch_size=4`, …); CLI args win over the file. Without `--config`, the built-in defaults target a ~24 GB GPU.
+`config/train_rust.yaml` ships with sane defaults for a **16 GB GPU (RTX 5080) at 128×128** and is loaded automatically — no `--config` needed. Edit it in place, or override any field on the CLI (`--max_hours=10`, `--genforecast_batch_size=4`, …; CLI args win over the file). Use `--config=<other.yaml>` to load a different file instead; the script's built-in fallback defaults (used only if this file is missing) target a ~24 GB GPU.
 
 The index file passed in `DGMR_RADAR_INDEX` must list crops sized for the `--height`/`--width` you choose: `index_128.txt` for 128×128 (the verified smaller-GPU recipe below), `index_256.txt` for the 256×256 defaults. The two-column `index.txt` produced by dgmr-rs for full-frame training is not compatible — `parse_index` requires `timestamp,x,y[,weight]`.
 
-Common overrides:
+Which stage runs, and whether it restarts or resumes, is controlled by two config fields — `stages` and `resume` — so you never have to remember CLI flags. Edit them in `config/train_rust.yaml`:
 
-```bash
-uv run python train_rust.py --height=128 --width=128   # smaller crops (needs index_128.txt)
-uv run python train_rust.py --skip_autoenc=True        # only stage 2 (uses best existing ckpt)
-uv run python train_rust.py --force_autoenc=True       # always retrain stage 1
-```
+| `stages` | `resume` | effect |
+|---|---|---|
+| `both` | `false` | train the autoencoder, then the diffusion model — both from scratch |
+| `diffusion` | `false` | train the diffusion model only, fresh (reuse the existing autoencoder) |
+| `diffusion` | `true` | resume the diffusion model from its `last.ckpt` |
+| `autoenc` | `true` | resume / extend the autoencoder only (stop before diffusion) |
 
-If `--autoenc_dir` (default `../models/autoenc_rust`) already contains checkpoints you'll be prompted whether to re-train stage 1; pressing Enter skips it and goes straight to diffusion.
+The command is always the same: `uv run python train_rust.py` (the shipped config loads by default). Any field can still be overridden on the CLI if you prefer (`--stages=diffusion --resume=True`).
 
 GPU memory: the built-in defaults (256×256, `--autoenc_batch_size=16`, `--genforecast_batch_size=8`) assume a ~24 GB GPU. Both stages default to `--precision=bf16-mixed`. Stage 2's 670 M-param UNet plus an EMA shadow copy and fp32 AdamW state alone is ~13.5 GB, so on a 16 GB card you also need 8-bit AdamW. Install the optional bitsandbytes extra:
 
@@ -157,7 +158,7 @@ GPU memory: the built-in defaults (256×256, `--autoenc_batch_size=16`, `--genfo
 uv sync --extra low-vram      # installs bitsandbytes (needed for optimizer_8bit)
 ```
 
-The shipped `config/train_rust.yaml` already encodes the **16 GB recipe**: 128×128, `optimizer_8bit: true`, `genforecast_batch_size: 8` (~14.5 GB; drop to 4 or 2 if you OOM — batch 8 is ~2× faster than 2 at 128×128 and still fits). Use `--autoenc_batch_size=N` / `--genforecast_batch_size=N` to scale; `--precision=32` opts out of mixed precision.
+The shipped `config/train_rust.yaml` already encodes the **16 GB recipe**: 128×128, `optimizer_8bit: true`, `genforecast_batch_size: 4` (verified to peak ~15.2 GB including the EMA store and the sample preview; **batch 8 OOMs** on 16 GB even with 8-bit AdamW). Use `--autoenc_batch_size=N` / `--genforecast_batch_size=N` to scale; `--precision=32` opts out of mixed precision.
 
 The two underlying scripts (`train_autoenc_rust.py` and `train_genforecast_rust.py`) can still be invoked directly when you need finer control — `train_rust.py` is just a thin orchestrator. All scripts split the index file 90/10 deterministically (seed 42, matching dgmr-rs) into train and validation, and use the `weight` column of the index as a `WeightedRandomSampler` on the training loader (disable with `--use_weighted_sampler=False`).
 
@@ -168,7 +169,7 @@ The two underlying scripts (`train_autoenc_rust.py` and `train_genforecast_rust.
 | field | default | meaning |
 |---|---|---|
 | `height` / `width` | 128 | crop size (÷32; index must match) |
-| `autoenc_batch_size` / `genforecast_batch_size` | 16 / 8 | per-stage batch (16 GB) |
+| `autoenc_batch_size` / `genforecast_batch_size` | 16 / 4 | per-stage batch (16 GB; diffusion batch 8 OOMs) |
 | `optimizer_8bit` | true | 8-bit AdamW (required for the diffusion stage at 128 on 16 GB) |
 | `num_workers` | 8 | dataloader workers (the autoencoder is data-bound; ~8 is the sweet spot) |
 | `limit_train_batches` | 2000 | steps per "epoch" (≈8 min); `null` = full ~17 h epoch |
@@ -176,18 +177,22 @@ The two underlying scripts (`train_autoenc_rust.py` and `train_genforecast_rust.
 | `early_stopping_patience` | 20 | epochs without val improvement before stopping; `0` disables |
 | `max_hours` | null | wall-clock budget **per stage** (for time-boxed chunks) |
 | `sample_every_n_epochs` | 1 | TensorBoard preview cadence; `0` disables |
-| `skip_autoenc` / `force_autoenc` | false | skip / force stage 1 |
-| `genforecast_ckpt_path` | null | resume the diffusion stage from this checkpoint |
+| `stages` | both | which stage(s) to run: `both` / `autoenc` / `diffusion` |
+| `resume` | false | continue each run stage from its `last.ckpt` (vs restart from scratch) |
 
 The defaults cap the "epoch" at 2000 train / 50 val batches because a full epoch over the 2.3 M-crop 128 index is ~17 h on a 16 GB card — far too long when validation, checkpoints, previews and early-stopping all fire per epoch. Set both limits to `null` for true full epochs.
 
 ### Monitoring training (TensorBoard)
 
-Both stages log to TensorBoard under `<model_dir>/tb` (no extra install — `tensorboard` is a dependency):
+Both stages log to TensorBoard under `<model_dir>/tb` (no extra install — `tensorboard` is a dependency). Launch it from `scripts/` so the relative path resolves; run it from anywhere else and TensorBoard finds nothing ("No dashboards are active") — pass an absolute path instead.
 
 ```bash
-tensorboard --logdir ../models/genforecast_rust   # or ../models/autoenc_rust
+cd scripts
+tensorboard --logdir ../models/autoenc_rust                    # autoencoder -> http://localhost:6006
+tensorboard --logdir ../models/genforecast_rust --port 6007   # diffusion   -> http://localhost:6007
 ```
+
+TensorBoard binds port 6006 by default, so to watch both stages at the same time run each in its own shell and give the second a distinct `--port` (as above). To see everything in one dashboard instead, point a single instance at the parent dir: `tensorboard --logdir ../models` lists each stage as a separate run.
 
 - **Autoencoder:** `val_rec_loss` curve + an **input-vs-reconstruction** image grid (`val/reconstruction`).
 - **Diffusion:** `val_loss_ema` curve + a **ground-truth-vs-forecast** image grid (`val/forecast`).
@@ -196,19 +201,19 @@ For a diffusion model the loss number barely reflects sample quality, so watch t
 
 ### Resuming and time-boxed (iterative) training
 
-Checkpoints are written every epoch, and `save_last=True` keeps a `last.ckpt` that always reflects the most recent epoch — the right thing to resume from (the best-named ckpt is kept for deployment). Resuming restores optimizer/LR/EMA/epoch — a true continue, not a weights-only reload.
+Checkpoints are written every epoch, and `save_last=True` keeps a `last.ckpt` that always reflects the most recent epoch — the right thing to resume from (the best-named ckpt is kept for deployment). Resuming restores optimizer/LR/EMA/epoch — a true continue, not a weights-only reload. `resume: true` falls back to a fresh start when there's no `last.ckpt` yet, so you can leave it on `true` across every chunk (including the first); use `resume: false` to force a restart.
 
 So you can train in chunks — run for N hours, stop, continue later, repeat:
 
 ```bash
 # first run: autoencoder (runs to convergence), then a diffusion chunk.
 # --max_hours caps EACH stage; the autoencoder normally early-stops well before it.
-uv run python train_rust.py --config=../config/train_rust.yaml --max_hours=10
+uv run python train_rust.py --max_hours=10
 
-# continue the diffusion stage for another chunk (skips stage 1, resumes from last.ckpt)
-uv run python train_rust.py --config=../config/train_rust.yaml \
-    --skip_autoenc=True --max_hours=10 \
-    --genforecast_ckpt_path=../models/genforecast_rust/last.ckpt
+# continue the diffusion stage for another chunk: set stages=diffusion, resume=true in the
+# config (shown here as CLI overrides) — it picks up genforecast_rust/last.ckpt automatically
+uv run python train_rust.py \
+    --stages=diffusion --resume=True --max_hours=10
 ```
 
 Each chunk is just more gradient steps → a monotonically better model. With the short default epochs a stopped run loses ≤ one epoch. To stop *only* on the time budget (not early-stopping), set `early_stopping_patience: 0`.
@@ -220,7 +225,7 @@ Measured on a 16 GB RTX 5080 at 128×128 (varies with hardware/dataset):
 | stage | throughput | full epoch (≈2.08 M train crops) |
 |---|---|---|
 | autoencoder (batch 16) | ~100 samples/s (data-bound) | ~5.8 h |
-| diffusion (batch 8, 8-bit Adam) | ~34 samples/s (compute-bound) | ~17 h |
+| diffusion (batch 4, 8-bit Adam) | ~20 samples/s (compute-bound) | ~29 h |
 
 This is why the config caps `limit_train_batches`. Note that training time scales with **gradient steps**, not the size of the crop pool — training on fewer crops doesn't make a run finish sooner, it only reduces data variety (and raises overfitting risk).
 
