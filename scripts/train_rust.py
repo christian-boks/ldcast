@@ -45,11 +45,12 @@ def _check_bridge():
         import dgmr_py  # noqa: F401
     except ImportError as e:
         sys.exit(
-            f"Cannot import dgmr_py ({e}). Build the bridge first:\n"
-            "  cd /home/christian/github/ldcast\n"
+            f"Cannot import dgmr_py ({e}). Build the bridge first (from the ldcast repo root):\n"
             "  uv pip install 'maturin>=1.7,<2'\n"
-            "  VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --release "
-            "--manifest-path ../dgmr-py/Cargo.toml"
+            "  # CARGO_NET_GIT_FETCH_WITH_CLI=true is required: dgmr-py pulls private hdf5_* deps\n"
+            "  # over SSH, and cargo's built-in libgit2 auth fails where the git CLI succeeds.\n"
+            "  CARGO_NET_GIT_FETCH_WITH_CLI=true VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop \\\n"
+            "    --release --manifest-path ../dgmr-py/Cargo.toml"
         )
 
 
@@ -127,6 +128,8 @@ def run(
     width: int = 256,
     autoenc_batch_size: int = 16,
     genforecast_batch_size: int = 8,
+    genforecast_lr: float = 1e-4,
+    genforecast_accumulate_grad_batches: int = 1,
     num_workers: int = 4,
     past_steps: int = 4,
     future_steps: int = 8,
@@ -212,6 +215,8 @@ def run(
             f"--height={height}",
             f"--width={width}",
             f"--batch_size={genforecast_batch_size}",
+            f"--lr={genforecast_lr}",
+            f"--accumulate_grad_batches={genforecast_accumulate_grad_batches}",
             f"--num_workers={num_workers}",
             f"--past_steps={past_steps}",
             f"--future_steps={future_steps}",

@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv --version)",
+      "Bash(uv sync *)",
+      "Bash(uv run *)",
+      "Bash(/home/christian/github/ldcast/.venv/bin/python --version)",
+      "Bash(DGMR_RADAR_ROOT=/opt/radar_data uv run python /tmp/diag_recon.py)",
+      "Bash(DGMR_RADAR_ROOT=/opt/radar_data uv run python /tmp/render_recon.py)",
+      "Bash(DGMR_RADAR_ROOT=/opt/radar_data uv run python /tmp/test_diff_case.py)",
+      "Bash(nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader)",
+      "Bash(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader)",
+      "Bash(awk '{print $5, $9}')",
+      "Bash(DGMR_RADAR_ROOT=/opt/radar_data uv run python /tmp/ensemble_forecast.py)",
+      "Bash(DGMR_RADAR_ROOT=/opt/radar_data uv run python /tmp/check_past.py)",
+      "Bash(awk '{printf \"%.1f GB  %s\\\\n\", $5/1e9, $NF}')",
+      "Bash(awk '{printf \" %.1f GB %s\\\\n\", $5/1e9, $NF}')",
+      "Bash(rm -f models/genforecast_rust/*.ckpt)"
+    ]
+  }
+}

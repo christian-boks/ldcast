@@ -222,6 +222,14 @@ class RustRadarDataModule(pl.LightningDataModule):
                     weights, num_samples=len(entries), replacement=True
                 )
                 shuffle = False
+        # Python 3.14 changed the default multiprocessing start method on Linux
+        # from 'fork' to 'forkserver', which pickles the dataset to hand it to
+        # each worker. RustRadarDataset holds dgmr_py IndexEntry objects (PyO3,
+        # not picklable) and is written to build its per-worker cache after a
+        # fork (see __init__). Force 'fork' so workers inherit entries by COW
+        # instead of pickling them. Workers do CPU-only work, so forking after
+        # CUDA init in the parent is safe (this is the pre-3.14 default behaviour).
+        mp_context = "fork" if self.num_workers > 0 else None
         return DataLoader(
             ds,
             batch_size=self.batch_size,
@@ -232,6 +240,7 @@ class RustRadarDataModule(pl.LightningDataModule):
             pin_memory=True,
             collate_fn=self._collate,
             drop_last=shuffle or sampler is not None,
+            multiprocessing_context=mp_context,
         )
 
     def train_dataloader(self):

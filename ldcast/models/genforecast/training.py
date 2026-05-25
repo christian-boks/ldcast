@@ -29,6 +29,7 @@ def setup_genforecast_training(
     sample_every_n_epochs=1,
     max_hours=None,
     early_stopping_patience=6,
+    accumulate_grad_batches=1,
 ):
     ldm = diffusion.LatentDiffusion(model, autoencoder,
         context_encoder=context_encoder, lr=lr,
@@ -66,6 +67,7 @@ def setup_genforecast_training(
         accelerator=accelerator,
         devices=devices,
         max_epochs=max_epochs,
+        accumulate_grad_batches=accumulate_grad_batches,
         strategy=('ddp' if num_gpus > 1 else 'auto'),
         callbacks=callbacks,
         logger=TensorBoardLogger(save_dir=model_dir, name="tb"),

@@ -1,5 +1,105 @@
 # LDCast Engineering Journal
 
+## 2026-05-25 — Got rust training running again on the Python 3.14 venv (3 blockers)
+
+**What:** Brought the dgmr-rs rust training pipeline back up after the venv moved to Python
+3.14. Three separate blockers, fixed in order:
+
+1. **maturin/cargo SSH fetch (env only).** `maturin develop` failed fetching the private
+   `hdf5_*` deps (`no authentication methods succeeded` from cargo's built-in libgit2). The git
+   CLI authenticates fine (`git ls-remote` returns the exact rev cargo called "not found"). Fixed
+   by building with `CARGO_NET_GIT_FETCH_WITH_CLI=true`. Note `dgmr-py/.cargo/config` already sets
+   `git-fetch-with-cli = true` but cargo reads `.cargo/config` from the CWD, not the manifest dir,
+   so running maturin from `ldcast/` ignored it — the env var works regardless of CWD.
+2. **bitsandbytes missing (env only).** `optimizer_8bit: true` → `configure_optimizers` does
+   `import bitsandbytes`, which wasn't in the 3.14 venv (it's the `low-vram` optional extra, not a
+   core dep). Installed with `uv sync --extra low-vram --inexact`. `--inexact` is essential: a
+   plain sync would uninstall the editable `dgmr-py` and `maturin` (dry-run confirmed). Got
+   `bitsandbytes==0.49.2`; verified a real `AdamW8bit` step runs on the RTX 5080 (sm_120 / CUDA 13).
+3. **CODE CHANGE — Python 3.14 forkserver pickling.** `ldcast/features/rust_data.py`. Py3.14
+   switched the default multiprocessing start method on Linux from `fork` to `forkserver`, which
+   pickles the dataset to hand it to each DataLoader worker. `RustRadarDataset` holds dgmr_py
+   `IndexEntry` objects (PyO3, not picklable) and was written to build its per-worker cache *after
+   a fork* → `TypeError: cannot pickle 'builtins.IndexEntry'` during the sanity check. Forced
+   `multiprocessing_context="fork"` on the train+val DataLoaders (only when num_workers>0). Workers
+   are CPU-only, so forking after CUDA init in the parent is safe — this is just the pre-3.14 default.
+
+Also refreshed the `_check_bridge()` build hint in `train_rust.py` (it had a stale `/home/christian`
+path and omitted the `CARGO_NET_GIT_FETCH_WITH_CLI=true` that the build actually needs).
+
+**Why:** The pipeline last trained on Python ≤3.13 (epoch=40 genforecast_rust checkpoints exist);
+the 3.14 venv reintroduced these because dgmr-py/bitsandbytes aren't reinstalled by a venv rebuild
+and the fork→forkserver default is a 3.14 behaviour change.
+
+**Outcome:** Working. `train_rust.py` (stages=diffusion, resume=true) resumed from
+`epoch=40-step=170500.ckpt` and is training epoch 41 at ~5 it/s, GPU 15.4/16.3 GB, 100% util —
+matching the config's ~15.2 GB batch-4 estimate. No NaNs.
+
+## 2026-05-24 — Forecast-quality CSI wired into per-epoch validation
+
+**What:** Added CSI @ {0.1, 1, 5} mm/h (+ ens-mean MAE/RMSE) to the `SamplePredictionLogger`
+callback (`ldcast/models/genforecast/monitor.py`). It scores the 4 wettest val cases (scanned
+once, cached, reused → comparable trend) under a fixed seed (CPU+CUDA RNG restored so training
+is unperturbed) and logs them as TensorBoard scalars (`val/csi_*`, `val/mae_mmhr`,
+`val/rmse_mmhr`) next to `val_loss_ema`. Reuses the forecast sampling that already runs each
+epoch on the GPU — no separate job.
+
+**Why:** `val_loss_ema` (eps-MSE) doesn't track sample quality and previews need a human. First
+built a standalone CPU ensemble-eval skill, but CPU diffusion sampling is too slow
+(~2-4 s/UNet-step → a trustworthy run was 30-70 min) and a 70-min comparison was disruptive.
+Pivoted (user's call) to riding the existing validation, and **removed** the standalone skill
+(`.claude/skills/eval-forecast/`) and its `eval_quality.csv`.
+
+**Takes effect on the next training restart** — the running process already imported
+`monitor.py`. With `resume: true`, stop & re-run `train_rust.py` to pick it up.
+
+**Outcome (2026-05-25):** Confirmed live. After the Python-3.14 restart (run `version_8`, resumed
+at epoch 41) the metrics log correctly. Exact tags carry an `mm` suffix — `val/csi_0.1mm`,
+`val/csi_1.0mm`, `val/csi_5.0mm`, `val/mae_mmhr`, `val/rmse_mmhr` — and TensorBoard groups them under
+a `val/` card (separate from `val_loss_ema`, which has no slash; easy to miss). Epoch-41 baseline (4
+wettest val cases, single point): CSI **0.306 / 0.0225 / 0.0001** @ {0.1, 1, 5} mm/h; MAE 0.864,
+RMSE 1.749 mm/h. The collapse toward zero at higher thresholds matches the documented
+under-forecasting (2026-05-23 entry) — CSI now gives a real per-epoch quality signal to trend,
+while `val_loss_ema` sits at its usual plateau (0.0981). Watch whether `csi_1.0mm`/`csi_5.0mm` climb
+with more training; if they stay flat it points to a recipe issue, not undertraining.
+
+## 2026-05-24 — Gradient accumulation to match the authors' effective batch (genforecast)
+
+**What:** Exposed two diffusion-stage knobs in `config/train_rust.yaml` and threaded them
+through `train_rust.py -> train_genforecast_rust.py -> setup_model -> setup_genforecast_training`
+into `pl.Trainer`:
+- `genforecast_accumulate_grad_batches: 16` (new) -> effective batch = 4 micro x 16 = 64
+- `genforecast_lr: 1.0e-4` (lr already existed in the lower functions; it just wasn't
+  configurable from the orchestrator)
+
+EMA left unchanged (it updates per batch, so its wall-clock smoothing window is unaffected
+by accumulation).
+
+**Why:** The `genforecast_rust` run plateaued — `val_loss_ema` best 0.098 @ epoch 6, flat
+~0.108 for the 13 epochs since; `train_loss` still drifting down; no NaNs. The run is
+memory-bound at micro-batch 4 (batch 8 OOMs at 128^2 on the 16 GB RTX 5080). The original
+LDCast authors trained the 128^2 diffusion model at batch 64 / lr 1e-4 with NO accumulation
+(git 7eec9d0, "Changes for paper revision"). Accumulation reproduces their effective batch of
+64 at zero extra VRAM, which (a) denoises the diffusion gradient (4 random timesteps/step ->
+64) and (b) re-matches lr=1e-4 (which the authors tuned for batch 64) to the batch, instead of
+running it against an effective batch of only 4.
+
+**Watch:** Judge from the TensorBoard forecast previews / offline metrics, NOT val_loss_ema
+(eps-MSE — saturates early and doesn't track sample quality; see comment in diffusion.py).
+`global_step` now advances ~16x slower per epoch (8000 batches -> 500 optimizer steps);
+wall-clock/epoch is ~unchanged. VRAM should be unchanged (~15.2 GB).
+
+**Outcome (interim, 2026-05-24, epoch 35 / +15 ep since resume):** Change confirmed live —
+`global_step` advances ~500/epoch (8000 batches / 16) vs 8000/epoch before, so accumulate=16 is
+active. Stable, no NaN. `val_loss_ema` still flat: best 0.0918 (first epoch after resume) vs prior
+0.098, bouncing 0.092-0.108, 14 epochs since best. So effective-batch-64 did NOT break the plateau
+on this proxy metric — consistent with the plateau being metric-saturation / data-limited rather
+than gradient-noise-limited. Preview check (user, 2026-05-24): forecast previews look a little
+better than ~epoch 20 — a modest *real* quality gain despite the flat val_loss_ema, confirming the
+metric/quality disconnect. Net: matching the authors' effective batch (64) helped slightly. Since a
+clean optimization fix bought only a little, the remaining headroom looks data/generalization-bound,
+not optimization-bound.
+
 ## 2026-05-23 — Diffusion under-forecasts; stop letting eps-MSE (`val_loss_ema`) control training
 
 Trained the rust autoencoder to convergence and ran a first real overnight diffusion run. The

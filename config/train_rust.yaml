@@ -34,6 +34,8 @@ num_workers: 8            # autoencoder is data-bound; ~8 is the sweet spot
 # --- batch sizes & precision (16 GB) ---
 autoenc_batch_size: 16
 genforecast_batch_size: 4    # verified: peaks ~15.2 GB at 128 (incl. EMA + sample preview); batch 8 OOMs (>16 GB)
+genforecast_lr: 1.0e-4       # original authors' lr (tuned for batch 64); now exposed as a config knob
+genforecast_accumulate_grad_batches: 16  # eff. batch = 4 micro x 16 = 64 = authors' 128^2 recipe; free on VRAM
 optimizer_8bit: true         # REQUIRED at 128: the 670M UNet + EMA + AdamW OOMs without it
 precision: bf16-mixed
 

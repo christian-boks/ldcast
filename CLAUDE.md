@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 LDCast is a latent diffusion model (LDM) for precipitation nowcasting — same family of models as Stable Diffusion, but conditioned on past radar frames rather than text. The repo contains both the library (`ldcast/`) for using the model and the scripts (`scripts/`) used to train and evaluate it for the LDCast paper (https://arxiv.org/abs/2304.12891).
 
+When making changes to the code, update journal.md with what was changed and why it was changed. To keep track of what  we have tried and what the outcome was.
+
 ## Install (uv)
 
 The project is set up for uv. From the repo root:
