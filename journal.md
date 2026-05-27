@@ -1,5 +1,332 @@
 # LDCast Engineering Journal
 
+## 2026-05-27 (eve) — Dry-out is CLOSED. Coverage restored; magnitude is the new bottleneck.
+
+**Status after the post-fix run (15 val epochs since restart, global epoch 28, healthy):**
+
+| metric             | prior uniform ceiling | post-fix best (v1) | latest |
+|--------------------|-----------------------|--------------------|--------|
+| `val/csi_0.1mm`    | ~0.25-0.45            | **0.961** (~2×) ✓  | 0.828  |
+| `val/csi_1.0mm`    | 0.174                 | **0.309** (~1.8×) ✓| 0.241  |
+| `val/csi_5.0mm`    | 0.024                 | 0.018 (~0.75×)     | 0.010  |
+
+**Qualitative confirmation (user reviewed `val/forecast` images, post-fix v1 ep0/8/14):**
+The cached val case is rain-covered everywhere in the truth row. The pre-fix predictions
+were almost-empty (the dry-out attractor the journal documented). Post-fix predictions
+**have rain across the whole canvas**, with the latest no longer suffering from the
+"almost empty" failure mode. Visually, the model is clearly forecasting rain — a
+qualitative regime change vs the pre-fix run.
+
+**Reframing the CSI numbers given a rain-covered truth:**
+- `csi_0.1mm = 0.83-0.96` means **83-96% of pixels correctly cross the light-rain threshold** —
+  not "found a rain blob in the right place" but "covering the canvas with rain, like the
+  truth." The dry-out is fixed.
+- `csi_1.0mm = 0.24` means only 24% of pixels cross 1 mm/h. The predicted rain is too soft
+  on average.
+- `csi_5.0mm = 0.01` means almost nothing in the prediction reaches heavy-rain intensity.
+  Peaks are smoothed/clipped.
+
+**So: coverage and structure are restored; the bottleneck moved to magnitude.** This is
+exactly the failure mode the journal's 2026-05-25 (eve) entry hedged on:
+> "At 2.36% exposure and still failing, emphasis *might* help — or the binding constraint
+> is elsewhere (autoenc latent rep of heavy rain / conditioning / eps-prediction at high
+> intensity). **Genuinely uncertain.**"
+
+Now resolved: the LDCast bin-equal-frequency sampler **did** restore the coverage/structure
+the prior uniform run lost (csi_0.1 ~2× ceiling; csi_1.0 ~1.8× ceiling), so the sampler
+hypothesis is confirmed for light/moderate rain. csi_5mm is at ~75% of the prior ceiling and
+plateauing (9 epochs since best as of analyzer run), which leans the heavy-rain bottleneck
+toward the *other* candidates the journal listed:
+- **Autoencoder's latent rep at high intensity.** Even though val_rec_loss=0.006 looks
+  pristine, that's dominated by easy crops. The autoencoder might be clipping/smoothing
+  rain peaks before the diffusion model ever sees them; if so, csi_5mm is bounded above
+  by the AE regardless of how good diffusion gets. Cheapest test: run encode+decode on
+  bin-9/10 cases specifically and measure pixel-wise error at the rain core.
+- **Eps-prediction breaking down in high-magnitude regions.** Even a perfect AE doesn't
+  help if the UNet's eps-MSE loss systematically under-weights large-magnitude latents.
+  Fix: rain-weighted diffusion loss (DGMR's `w(y) = max(y+1, 24)` is the prior art lever
+  the journal already flagged as deferred-until-uniform-sampling-confirmed). This is the
+  natural next experiment.
+- **scale_factor of the latents.** Tested in the 2026-05-21 entry on the *old* autoencoder
+  and found counterproductive there. Worth re-testing with the new AE, which has very
+  different latent statistics.
+
+**Eval signal is still 4-case-noisy.** csi_0.1 swung 0.10 → 0.96 over two consecutive
+epochs at the same global step. The peaks and the band tell the story; single epochs
+don't. Increasing `num_eval_cases` from 4 → 16 or 32 in `SamplePredictionLogger` would
+give a cleaner trend at modest val-cost; worth doing before the next experiment.
+
+**Outcome:** the dry-out attractor we've been chasing for ~10 days is **closed**. Diffusion
+is now training in a regime where progress is measurable and meaningful, and the next
+bottleneck is named (magnitude, specifically peaks at heavy-rain thresholds). The combined
+fix — LDCast indexer + compact NumPy loader + bin-0 dedup + LDCastEqualFrequencySampler +
+val-ordering bug fix — is what unlocked it. Run remains active, no need to stop yet.
+
+## 2026-05-27 — val ordering bug: CSI/forecast preview were scoring against an empty single-snapshot val
+
+**What:** Removed `np.sort(...)` from `val_idx` in `ldcast/features/rust_data.py::_load_ldcast_index`
+and bumped the genforecast monitor's `scan_batches` 32 -> 64.
+
+**Why (the bug):** `_load_ldcast_index` was building val_idx via
+`val_idx = np.sort(perm[:n_valid])` -- the sort was inherited from the
+PyO3-entries-list era as a cache-locality optimisation. With the LDCast indexer,
+the index emits *all spatial positions per timestamp consecutively*, so sorted
+val_idx clusters val into a tiny number of adjacent timestamps. Measured: the
+first 200 val rows (= val_dataloader's first 50 batches × batch 4 = the entire
+limit_val_batches window) were **all from a single 10-min snapshot at
+2022-09-11 12:30 UTC**, 78% bin 0, zero rows in bins 7-10. Effects:
+- `val_loss_ema` was scored on ~empty crops -> artificially low (the model
+  "wins" by predicting near-zero); we saw it drop to 0.018 vs prior ceiling
+  ~0.086, looking too good to be true (it was).
+- The genforecast monitor's `_fixed_cases` scans val_dataloader for the wettest
+  K, but the entire scannable window was that one quiet snapshot. The cached
+  "wettest 4" had **0% of pixels above 1.0 mm/h**; CSI@1mm and CSI@5mm were
+  numerically forced to 0 not because the model was bad, but because the truth
+  had nothing to score against. The `val/forecast` preview's truth row was
+  nearly blank for the same reason -- visually noticed by user, then traced.
+
+The actual model was being trained correctly on the LDCast bin-equal-frequency
+distribution (the train_idx sort was harmless; LDCastEqualFrequencySampler picks
+indices randomly). So 13 epochs of model state were preserved; only the val
+metrics were uninterpretable.
+
+**Fix:** `val_idx = perm[:n_valid]` (no sort) -> val_dataloader iterates val
+samples in random order, so the first 50 batches are representative across the
+whole index. Verified post-fix: first 200 val rows now span different days
+(2024-09-29, 2023-08-06, 2023-08-09, 2024-09-20, 2024-07-26 in the first 5),
+70% bin 0 (matching overall ~65%), 1 sample in bin 9. Cache locality for val
+is sacrificed, but val is bounded by limit_val_batches=50 and the data already
+sat in OS page cache from training -- val cost stays small.
+
+Also bumped `SamplePredictionLogger._fixed_cases(scan_batches=32 -> 64)` so the
+selection draws from 256 candidates (covers the full ~200-sample val set with
+margin); top-4 wettest are reliably in bins 8-10 once val is properly shuffled.
+
+**Outcome:** PENDING. Stopped the running diffusion run at epoch 13 step 7000
+(last.ckpt preserved, written 12:11), restarted with resume=true to pick up
+both fixes. The genforecast monitor recaches its eval cases on first val
+(only persists in the live process), so a new set of eval cases will be
+selected from the now-representative val. Expect val_loss_ema to JUMP UP at
+first val after restart (no longer artificially low) and CSI to take a different,
+meaningful scale -- give ~2-3 val epochs after restart before drawing conclusions.
+
+Train_idx sort kept: harmless (the LDCast sampler picks randomly), and a sorted
+train index is friendlier to anything that linearly scans train_ts/x/y.
+
+## 2026-05-26 — LDCast bin-equal-frequency sampling, wired in via the new index file
+
+**What:** Replaced the old `index_128.txt` / uniform-sampling path with the LDCast
+indexer's output (`/opt/radar_data/index_ldcast_128.txt`, 12 GB / 297 M rows;
+generator at `batch_hdf5_to_img/src/ld_indexer.rs`). The 4th column of the new
+file is LDCast's bin-equal-frequency importance weight
+`N_total / (num_nonempty_bins * N_in_bin)` over the same intensity bins as the
+original `EqualFrequencySampler` (`np.exp(np.linspace(np.log(0.2), np.log(50),
+10))` on per-crop 99th-percentile rain rate, 11 bins after bisect_left).
+Sampling proportional to weight gives uniform mass per bin — the rust-pipeline
+equivalent of the original LDCast sampler — and reintroduces the heavy-rain
+oversampling (~10-100× vs natural) that the previous uniform pass was missing.
+
+Four pieces:
+
+1. **`dgmr-py`** — two new `#[pyfunction]`s (`parse_ldcast_index`, `make_entry`).
+   `parse_ldcast_index` stream-parses the index file and returns four NumPy
+   arrays (`ts:i64` Unix seconds, `x:u16`, `y:u16`, `w:f32`) — ~4.7 GB for 297M
+   rows vs the ~36 GB a `Vec<PyIndexEntry>` would cost. Parse time ~28 s on
+   the 12 GB file. `make_entry` is a tiny constructor used per-`__getitem__`
+   to build the PyO3 `IndexEntry` `dgmr_py.load_sample` still wants.
+
+2. **`ldcast/features/rust_data.py`** — `RustRadarDataModule` and
+   `RustRadarDataset` now carry the compact NumPy arrays (no Python list of
+   PyO3 objects). New helper `_load_ldcast_index` parses → splits train/val →
+   **deduplicates bin 0 in TRAIN to a single representative row**, scaling its
+   weight by the bin's original population so the LDCast invariant
+   (`sum(weight)` per bin is constant) holds exactly. Bin 0 is ~65 % of the
+   raw file (~193 M of 297 M rows); bin-0 crops are functionally identical for
+   training (no rain anywhere in the 12-frame 128² window), so collapsing them
+   to one representative loses no information. Train shrank from 268 M →
+   93.6 M rows. Val left as a uniform sample of the raw index (val_loss_ema
+   just needs a representative slice, not the LDCast sampling distribution).
+
+3. **New `LDCastEqualFrequencySampler`** — torch's `WeightedRandomSampler`
+   calls `torch.multinomial`, which is capped at 2^24 ≈ 16.7 M categories, and
+   the 93.6 M-row train array trips this. Wrote a custom sampler that draws
+   uniformly across bin index and uniformly within bin (vectorised, ~0.01 s
+   for 200 k draws) — distributionally equivalent and not multinomial-bound.
+   Empirically: 200 k draws → 8.97-9.21 % per bin (target 9.09 % = 1/11);
+   deduped bin 0 hits ~9.06 % via repeated indexing of the same row.
+
+4. **Config + orchestrator** — `config/train_rust.yaml` switched
+   `index_path` to the LDCast file, added `use_weighted_sampler: true`, set
+   `stages: both` and `resume: false` to retrain both stages on the new
+   distribution (the autoencoder reconstructs whatever it's shown, so its
+   heavy-rain representation is the ceiling for the diffusion stage).
+   `scripts/train_rust.py` threads `use_weighted_sampler` to both stage
+   subprocesses. The stage scripts already accepted the flag.
+
+**Verified:** parser returns 297,453,114 rows in 28 s, 11 unique weights,
+`weight × count = 2.704e+7` constant across all bins (LDCast invariant from the
+indexer). Dedup keeps the invariant exactly in train: per-bin `sum(weight)` =
+2.434e+7 across all 11 train bins, including the single-row deduped bin 0.
+End-to-end smoke (`stages=diffusion --limit_train_batches=20 --max_epochs=1`):
+training step ~5.7 it/s at 128² batch 4, no NaN, GPU 15 GB, val loop completed.
+
+**Outcome:** PENDING. Needs the real `stages=both --resume=false` run. Stage 1
+retrains the autoencoder on the new distribution (~hours). Stage 2 is the
+actual test of the journal's sampler hypothesis — pre-registered prediction:
+bin-equal-frequency must beat the previous uniform pass on held-out
+`val/csi_5mm`. If it doesn't, the sampler hypothesis is dead and we look
+elsewhere (autoenc latent rep at high intensity, conditioning, eps-prediction
+at high intensity).
+
+**Old `index_128.txt` retired** — drop references to DGMR `q_n^-1` weights
+when discussing the index/sampler. The `parse_index` function in dgmr-py is
+left intact (other call sites still use it; `predict_rust.py` parses the index
+to look up a timestamp); only the *training* path uses `parse_ldcast_index`.
+
+## 2026-05-25 (eve) — Heavy-rain plateau: traced to the SAMPLER, not the loss. Falsifiable plan for tomorrow.
+
+**State of the fresh run** (`models/genforecast_rust/tb/version_0`, the sampler-flip + coverage-filter
+run; old run archived at `genforecast_rust_old/`): ~28 epochs, ACTIVE, no NaN. Dry-out is gone and the
+model produces rain, but skill has **plateaued with a clear threshold profile**:
+- `csi_0.1mm` (light): OK, ~0.25–0.45.
+- `csi_1.0mm` (moderate): flat ~0.07; best 0.174 @ ep8, never beaten.
+- `csi_5.0mm` (heavy): flat ~0.01; best 0.024 @ ep16, never beaten.
+- `val_loss_ema`: 0.40 → 0.086 (best @ ep24) then flat. `train_loss` ~0.12 and flat.
+- Early over/under-forecast instability (RMSE spiked to 324 mm/h ep0–9) **resolved by ~ep10**; RMSE now ~1.8.
+
+**The finding — the difference from original LDCast is sampling, not loss.** The diffusion loss is
+*identical* in both paths (`ldcast/models/diffusion/diffusion.py`, plain unweighted eps-MSE) — so the
+original needed **no** rain-weighted loss. What original LDCast has that this rust pipeline dropped:
+- **Original** (`scripts/train_nowcaster.py:122` `bins = np.exp(np.linspace(np.log(0.2), np.log(50), 10))`
+  → `split.DataModule(sampling_bins=…)` → `batch.StreamBatchDataset` (`:81`) → `sampling.EqualFrequencySampler`):
+  bins patches by 99th-pct intensity into ~11 bins and draws **each bin with equal probability**
+  (`sampling.py`: `self.rng.randint(self.num_bins, …)`) → heavy rain oversampled ~10–100× and crop-centered.
+  Confirmed the original genforecast stage uses this (`scripts/train_genforecast.py:10,120` import `setup_data`).
+- **Rust** (`ldcast/features/rust_data.py`): **uniform** over the rejection-sampled (wet-enriched) index
+  after we set `use_weighted_sampler=False`. No intensity stratification.
+So the original gets heavy-rain skill from the *sampler*; we lost it. Uniform was still the right fix vs the
+inverted `q_n^-1` (dry-oversampling) bug — but it's far weaker than LDCast's bin sampler.
+
+**"False epoch" nuance (user caught this):** `limit_train_batches=8000` × batch 4 = 32k crops/epoch ≈
+**1.4%** of the 2.3M index. So 28 epochs ≈ **0.39 true passes**, ~32% distinct coverage — still in the first
+sweep. BUT the heavy-rain *fraction per batch* is unchanged by epochs/coverage; heavy CSI stayed flat while
+coverage grew 0→32%, i.e. **fraction-bound, not coverage-bound**. More training / more data is a weak,
+expensive lever vs fixing the sampling fraction.
+
+**Heavy-rain prevalence check** (120 random crops, future frames): ≥0.1mm **43.9%**, ≥1mm **16.2%**,
+≥5mm **2.36%**, ≥10mm **0.62%** of pixels; 69% of crops contain ≥5mm pixels (57% have ≥100). Two takeaways:
+(a) `csi_5mm` is a **real** signal, not an empty-denominator artifact — the weakness is real; (b) heavy rain
+is **not starved** (2.36%), so my "model barely sees heavy rain" framing was overstated. At 2.36% exposure
+and still failing, emphasis *might* help — or the binding constraint is elsewhere (autoenc latent rep of
+heavy rain / conditioning / eps-prediction at high intensity). **Genuinely uncertain.**
+
+**Calibration note (important):** this run is the 3rd compounding fix (inverted sampler → coverage filter →
+now sampling fraction); each fix surfaced the next bottleneck. The sampler is the **best-supported
+hypothesis** (code-confirmed difference from original LDCast) but is **not proven** and not necessarily the
+last issue. Test before investing — don't treat the next fix as the answer.
+
+**Index generator is NOT on this machine** (separate repo; needs the raw radar archive which isn't here).
+Per-crop intensity for bin-sampling should ultimately be emitted by that generator (it already scans every
+crop to compute the `q_n^-1` weight column). For a *local* test we can compute intensity for a subset here
+(`dgmr_py` + `/opt/radar_data` are present).
+
+**PLAN FOR TOMORROW (falsifiable, in order):**
+1. **Trustworthy measurement first.** The `val/csi_*` monitor is 4 cases / 1 seed — too thin for the calls
+   I've been making. Score the current checkpoint on a larger held-out set with several ensemble members to
+   get real CSI-by-threshold. It may be less broken than the monitor suggests.
+2. **Pre-registered A/B for the sampler hypothesis** (this machine, no index-regen): compute per-crop
+   intensity for a subset, cache it; two short runs on the **same crop pool**, identical except sampling —
+   uniform vs intensity-bin equal-frequency (reuse the `use_weighted_sampler` plumbing in `rust_data.py`
+   with *correct* weights = 1/bin_population). **Pre-registered outcome: binned must beat uniform on
+   held-out `csi_5mm`, else the sampler hypothesis is dead and we look elsewhere.**
+3. **Only if (2) confirms:** emit per-crop intensity from the index generator (other machine) and wire an
+   `EqualFrequencySampler`-equivalent into `rust_data.py` for the full run.
+
+**Checkpoints:** `genforecast_save_top_k=3` keeps the last 3 by recency (+`last.ckpt`); the best epochs
+(ep8/16/24) are already pruned. For the A/B, set `genforecast_save_top_k=-1` (keep all) so the best can be
+picked offline.
+
+## 2026-05-25 — Restored multi-checkpoint saving for the diffusion stage (disk no longer constrained)
+
+**What:** The diffusion `ModelCheckpoint` (`ldcast/models/genforecast/training.py`) now keeps the N
+most-recent checkpoints + `last.ckpt` instead of a single rolling ckpt. New config knob
+`genforecast_save_top_k` (default 3) threaded config → `train_rust.py` → `train_genforecast_rust.py`
+→ `setup_model` → `setup_genforecast_training` (mirrors `genforecast_accumulate_grad_batches`).
+- ModelCheckpoint is now `monitor="step", mode="max", save_top_k=save_top_k, save_last=True,
+  filename="{epoch}-{step}"` (was `save_top_k=1, monitor=None, save_last=False`).
+- Updated the now-stale `_resume_ckpt` docstring (diffusion now writes a `last.ckpt`).
+
+**Why:** disk is no longer constrained. The old config kept only the latest epoch (the best could be
+lost — the `/analyze` run flagged this) and wrote no `last.ckpt`. "Adding EMA" needs no code: `LitEma`
+is a submodule of `LatentDiffusion`, so EMA shadow weights are already serialized in every full
+`.ckpt` (verified below) and inference applies them (`forecast.py` `model_ema.copy_to`).
+
+**Design choices:** recency-based retention, NOT a quality monitor — `val_loss_ema` (eps-MSE) doesn't
+track sample quality, and `val/csi_*` is `add_scalar`'d (not `self.log`'d) so isn't monitorable. Pick
+the best checkpoint offline (eval_genforecast / metrics / `/analyze`). Lightning 2.6.1 detail:
+`monitor=None` + `save_top_k>1` raises; `_monitor_candidates` always injects `step`/`epoch`, so
+`monitor="step", mode="max"` keeps the most-recent k. Autoenc stage left unchanged (already
+`save_top_k=3` + `last.ckpt`; ckpts ~5 MB; no EMA).
+
+**Verified:** (a) standalone tiny Lightning fit kept exactly the 2 most-recent epoch ckpts +
+`last.ckpt`; (b) end-to-end diffusion smoke run (throwaway dir, `save_top_k=2`, 3 epochs) kept
+`epoch=1-step=12` + `epoch=2-step=18` (pruned `epoch=0-step=6`) + `last.ckpt`, each 6.3 GB, each with
+`model_ema.*` (252 keys) present; `--save_top_k=2` was correctly forwarded through the subprocess.
+
+**Footgun found (pre-existing, NOT fixed):** `fire` parses lowercase `--resume=false` as the string
+`"false"` → **truthy** → resume stays ON (capital `--resume=False` works; YAML `resume: false` works).
+So to start a FRESH run, set `resume: false` in `config/train_rust.yaml` (or clear the old ckpts) —
+do NOT rely on `--resume=false` on the CLI. Critical right now: the fresh diffusion run (for the
+sampler + coverage fixes) must NOT resume the epoch-52 weights, which were trained on the pre-fix
+inverted distribution.
+
+## 2026-05-25 — ROOT CAUSE of diffusion dry-out: training sampler oversampled DRY crops ~478x
+
+**What:** Flipped `use_weighted_sampler` default `True -> False` in `ldcast/features/rust_data.py`
+and both rust train scripts (`train_genforecast_rust.py`, `train_autoenc_rust.py`). Diffusion/autoenc
+now train with **uniform sampling** over the index. Documented the reason in `rust_data.py._loader`
+so it can't silently regress.
+
+**Why (the bug):** `RustRadarDataModule._loader` fed `entry.weight` into a `WeightedRandomSampler`.
+But `entry.weight` (4th column of `index_*.txt`, exposed by dgmr-py `parse_index`) is DGMR's
+*evaluation-time* importance weight `q_n^-1` (Ravuri et al. 2021, Supp. A.1) — LARGE for dry crops,
+small for rainy ones. It exists only to UNBIAS eval metrics; DGMR's own rust trainer ignores it
+(`dgmr-rs/src/data.rs:54` "weight ignored") and trains uniformly over the already rejection-sampled
+(rain-enriched) index. Feeding `q_n^-1` to the sampler oversampled the DRY tail, so the diffusion
+model learned to forecast ~nothing.
+
+**Evidence (measured on `/opt/radar_data/index_128.txt`, 2.3M crops):**
+- weight column: min 2,575, max 1,280,000 (capped), mean 127,922 — not a probability.
+- HIGH-weight crops (~1.28e6, what the sampler favored): mean **0.00 mm/hr, 0% wet**, 15% no-coverage.
+- LOW-weight crops (~2.7e3): mean **6.89 mm/hr, 98% wet**.
+- => oversampled dry vs rainy by ~1.28e6/2.7e3 ≈ **478x**.
+- UNIFORM draw (what `False` now gives): mean **0.47 mm/hr, 49% wet** (median 51%) — the index is
+  already rain-enriched, so uniform is the correct, DGMR-faithful distribution.
+
+This is the long-running "diffusion dries out / worse than persistence / flat CSI / val_loss_ema
+plateau" finding (2026-05-23, 2026-05-24). It was NOT undertraining, optimizer, LR, scale_factor or
+effective-batch (all previously tried and inert) — the training distribution was inverted. The
+autoencoder reconstructs whatever it is shown so it never flagged this, but it too was training on the
+dry-skewed mix; uniform is better for it as well.
+
+**Outcome:** PENDING. Needs a FRESH diffusion run (resume from scratch — the epoch-52 weights were
+trained on the wrong distribution). Watch `val/csi_*` (esp. `csi_1.0mm`); they should rise above the
+flat ~0.02-0.06 band for the first time. If `csi_5.0mm` still lags once the model is clearly producing
+rain, add a rain-weighted diffusion loss (DGMR uses `w(y)=max(y+1,24)`) — deferred until uniform
+sampling is confirmed.
+
+**Related — no-coverage filter added (same investigation):** off-radar pixels (sentinel `-1/32` mm/hr)
+were mapped to `0.02` mm/hr by `mmhr_rainrate_transform` (indistinguishable from real dry) and never
+masked from the latent diffusion loss. Mirrored the original LDCast exclusion (`patches.py`:
+`np.isfinite(patch).all()`) with a tolerance for DMI's circular coverage: `RustRadarDataset.__getitem__`
+now skips a crop (reusing the archive-gap retry loop) when its off-radar fraction exceeds
+`max_nocoverage_frac`. Threaded through `RustRadarDataModule` + both rust train scripts; default
+**0.05** (keep crops ≥95% within coverage), `1.0` disables it, and it is auto-skipped in `full_frame`
+mode (padding is no-coverage by design). Measured per-crop no-coverage over 150 uniform crops: 92%
+fully covered, median 0%, thin tail (1.3% are 50-100% off-radar); 0.05 drops ~6.7% and removes the
+whole bad tail. Smoke-tested: rejects an all-off-radar set, passes covered crops (correct shapes),
+bypassable at 1.0. Latent-space loss masking (harder, lower value) intentionally NOT done.
+
 ## 2026-05-25 — Got rust training running again on the Python 3.14 venv (3 blockers)
 
 **What:** Brought the dgmr-rs rust training pipeline back up after the venv moved to Python

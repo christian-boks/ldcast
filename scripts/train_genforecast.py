@@ -30,6 +30,7 @@ def setup_model(
     max_hours=None,
     early_stopping_patience=6,
     accumulate_grad_batches=1,
+    save_top_k=3,
 ):
     enc = encoder.SimpleConvEncoder()
     dec = encoder.SimpleConvDecoder()    
@@ -86,6 +87,7 @@ def setup_model(
         max_hours=max_hours,
         early_stopping_patience=early_stopping_patience,
         accumulate_grad_batches=accumulate_grad_batches,
+        save_top_k=save_top_k,
     )
     gc.collect()
     return (ldm, trainer)

@@ -96,9 +96,9 @@ def _extract_state_dict(ckpt_path: Path, out_path: Path) -> Path:
 def _resume_ckpt(stage_dir: Path) -> str | None:
     """Path to the checkpoint to resume from, or None to start fresh.
 
-    The autoencoder stage keeps a last.ckpt; the diffusion stage keeps a single
-    rolling 'epoch=..-step=..ckpt' (save_top_k=1, no last.ckpt), so prefer
-    last.ckpt when present and otherwise fall back to the newest *.ckpt.
+    Both stages now keep a last.ckpt plus their top-k 'epoch=..-step=..ckpt'
+    files, so prefer last.ckpt when present and otherwise fall back to the newest
+    *.ckpt (covers legacy dirs written before save_last=True).
 
     resume=true means "continue if there's a checkpoint, else start fresh", so a
     first run (no checkpoint yet) starts from scratch instead of erroring. One
@@ -130,6 +130,7 @@ def run(
     genforecast_batch_size: int = 8,
     genforecast_lr: float = 1e-4,
     genforecast_accumulate_grad_batches: int = 1,
+    genforecast_save_top_k: int = 3,
     num_workers: int = 4,
     past_steps: int = 4,
     future_steps: int = 8,
@@ -143,6 +144,7 @@ def run(
     max_hours: float | None = None,
     early_stopping_patience: int = 6,
     sample_every_n_epochs: int = 1,
+    use_weighted_sampler: bool = False,
 ):
     """Run the autoencoder and/or diffusion stages per the config (see module docstring)."""
     valid_stages = ("both", "autoenc", "diffusion")
@@ -178,6 +180,7 @@ def run(
             f"--max_epochs={max_epochs}",
             f"--sample_every_n_epochs={sample_every_n_epochs}",
             f"--early_stopping_patience={early_stopping_patience}",
+            f"--use_weighted_sampler={use_weighted_sampler}",
         ]
         if limit_train_batches is not None:
             cmd.append(f"--limit_train_batches={limit_train_batches}")
@@ -217,6 +220,7 @@ def run(
             f"--batch_size={genforecast_batch_size}",
             f"--lr={genforecast_lr}",
             f"--accumulate_grad_batches={genforecast_accumulate_grad_batches}",
+            f"--save_top_k={genforecast_save_top_k}",
             f"--num_workers={num_workers}",
             f"--past_steps={past_steps}",
             f"--future_steps={future_steps}",
@@ -225,6 +229,7 @@ def run(
             f"--max_epochs={max_epochs}",
             f"--sample_every_n_epochs={sample_every_n_epochs}",
             f"--early_stopping_patience={early_stopping_patience}",
+            f"--use_weighted_sampler={use_weighted_sampler}",
         ]
         if limit_train_batches is not None:
             cmd.append(f"--limit_train_batches={limit_train_batches}")

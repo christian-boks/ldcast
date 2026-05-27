@@ -13,10 +13,16 @@
 # Where the radar archive and crop index live — set these and you don't need any env vars in your
 # shell. index_path is passed straight to the loader; radar_root is required by the Rust loader,
 # which only reads it from DGMR_RADAR_ROOT, so the orchestrator exports it for you. index_path must
-# match height/width below (index_128.txt for 128, index_256.txt for 256). null on either falls
-# back to the matching env var. NOTE: machine-specific paths.
+# match height/width below (index_ldcast_128.txt for 128, index_ldcast_256.txt for 256). null on
+# either falls back to the matching env var. NOTE: machine-specific paths.
 radar_root: /opt/radar_data
-index_path: /opt/radar_data/index_128.txt
+index_path: /opt/radar_data/index_ldcast_128.txt
+
+# Use the LDCast bin-equal-frequency weights (4th column of index_ldcast_*.txt) with
+# WeightedRandomSampler to reproduce the original LDCast EqualFrequencySampler distribution —
+# heavy rain ends up oversampled ~10-100x vs the natural distribution. REQUIRED with the LDCast
+# index; sampling proportional to weight makes every LDCast intensity bin equally likely per draw.
+use_weighted_sampler: true
 
 # --- where checkpoints go ---
 autoenc_dir: ../models/autoenc_rust
@@ -36,6 +42,7 @@ autoenc_batch_size: 16
 genforecast_batch_size: 4    # verified: peaks ~15.2 GB at 128 (incl. EMA + sample preview); batch 8 OOMs (>16 GB)
 genforecast_lr: 1.0e-4       # original authors' lr (tuned for batch 64); now exposed as a config knob
 genforecast_accumulate_grad_batches: 16  # eff. batch = 4 micro x 16 = 64 = authors' 128^2 recipe; free on VRAM
+genforecast_save_top_k: 3    # keep the N most-recent diffusion ckpts (+ last.ckpt); ~6.3 GB each. -1 = keep all
 optimizer_8bit: true         # REQUIRED at 128: the 670M UNet + EMA + AdamW OOMs without it
 precision: bf16-mixed
 

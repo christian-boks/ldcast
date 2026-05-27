@@ -39,7 +39,8 @@ def train(
     cache_capacity=64,
     valid_frac=0.1,
     seed=42,
-    use_weighted_sampler=True,
+    use_weighted_sampler=False,
+    max_nocoverage_frac=0.05,
     model_dir="../models/genforecast_rust",
     lr=1e-4,
     ckpt_path=None,
@@ -54,6 +55,7 @@ def train(
     max_hours=None,
     early_stopping_patience=6,
     accumulate_grad_batches=1,
+    save_top_k=3,
 ):
     if index_path is None:
         index_path = os.environ["DGMR_RADAR_INDEX"]
@@ -76,6 +78,7 @@ def train(
         valid_frac=valid_frac,
         seed=seed,
         use_weighted_sampler=use_weighted_sampler,
+        max_nocoverage_frac=max_nocoverage_frac,
     )
 
     print("Setting up model...")
@@ -97,6 +100,7 @@ def train(
         max_hours=max_hours,
         early_stopping_patience=early_stopping_patience,
         accumulate_grad_batches=accumulate_grad_batches,
+        save_top_k=save_top_k,
     )
     gc.collect()
 

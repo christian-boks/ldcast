@@ -33,6 +33,29 @@ STAGE_METRICS = {
     "diffusion": ("val_loss_ema", ["val_loss"]),
 }
 
+# Forecast-quality scalars logged by ldcast/models/genforecast/monitor.py once per
+# validation_epoch_end. CSI at three rain thresholds is the actual signal for diffusion
+# (val_loss_ema is eps-MSE and saturates early). Computed on a small fixed set of the
+# wettest val cases, so single epochs are noisy -- read the trend.
+QUALITY_METRICS = {
+    "diffusion": {
+        "csi": ["val/csi_0.1mm", "val/csi_1.0mm", "val/csi_5.0mm"],
+        "err": ["val/mae_mmhr", "val/rmse_mmhr"],
+    },
+}
+
+
+def trend_label(v: np.ndarray) -> tuple[float, float, str]:
+    """Linear-fit slope over the last min(8, len(v)) points. Returns (slope, pct/ep, label)."""
+    kk = min(8, len(v))
+    if kk < 2:
+        return (0.0, 0.0, "too short")
+    slope = float(np.polyfit(np.arange(kk), v[-kk:], 1)[0])
+    denom = abs(float(v[-kk:].mean())) or 1.0
+    pct = slope / denom * 100
+    lab = "PLATEAU (flat)" if abs(pct) < 0.5 else ("rising" if slope > 0 else "falling")
+    return (slope, pct, lab)
+
 
 def rel(p: Path):
     try:
@@ -170,6 +193,35 @@ def main():
         for t in secondary:
             if t in data:
                 print(f"  {t}: {fmt(data[t][1])}")
+
+    quality = QUALITY_METRICS.get(stage)
+    if quality:
+        # The /analyze prompt notes: for diffusion, val_loss_ema is NOT a quality signal
+        # (it's eps-MSE; plateaus early). val/csi_*mm is. Lead with CSI when judging
+        # whether the run is getting better at forecasting rain -- especially csi_5mm
+        # for the LDCast sampler hypothesis (whether heavy-rain skill is improving).
+        print("\n--- QUALITY METRICS (val/csi_*, val/mae|rmse_mmhr — the real diffusion signal) ---")
+        csi_present = [t for t in quality["csi"] if t in data]
+        if not csi_present:
+            print("  (no val/csi_* tags yet — first val epoch hasn't fired, or genforecast")
+            print("   monitor disabled)")
+        for t in csi_present:
+            _, v = data[t]
+            best_i = int(v.argmax())  # CSI: higher is better
+            slope, pct, lab = trend_label(v)
+            since_best = (len(v) - 1) - best_i
+            print(f"  {t}: n={len(v)}")
+            print(f"    per-epoch: {fmt(v, 4)}")
+            print(f"    best={v.max():.4f} (epoch idx {best_i}/{len(v)-1})  "
+                  f"latest={v[-1]:.4f}  epochs since best: {since_best}")
+            if len(v) >= 3:
+                print(f"    recent slope (last {min(8, len(v))} ep): {slope:+.5f}/ep ({pct:+.2f}%/ep) -> {lab}")
+        for t in quality["err"]:
+            if t in data:
+                _, v = data[t]
+                best_i = int(v.argmin())  # MAE/RMSE: lower is better
+                print(f"  {t}: per-epoch: {fmt(v, 4)}  "
+                      f"best={v.min():.4f} @ ep {best_i}  latest={v[-1]:.4f}")
 
     print("\n--- TRAIN LOSS (per-step, noisy; read the binned trend, not raw spikes) ---")
     if "train_loss" in data:

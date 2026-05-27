@@ -30,7 +30,8 @@ def train(
     cache_capacity=64,
     valid_frac=0.1,
     seed=42,
-    use_weighted_sampler=True,
+    use_weighted_sampler=False,
+    max_nocoverage_frac=0.05,
     model_dir="../models/autoenc_rust",
     ckpt_path=None,
     precision="bf16-mixed",
@@ -59,6 +60,7 @@ def train(
         valid_frac=valid_frac,
         seed=seed,
         use_weighted_sampler=use_weighted_sampler,
+        max_nocoverage_frac=max_nocoverage_frac,
     )
 
     print("Setting up model...")

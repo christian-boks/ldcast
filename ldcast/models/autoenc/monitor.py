@@ -15,21 +15,33 @@ from ...visualization.plots import plot_precip_image, reverse_transform_R
 
 
 class ReconstructionLogger(pl.Callback):
-    def __init__(self, every_n_epochs=1, max_frames=4):
+    def __init__(self, every_n_epochs=1, max_frames=4, scan_batches=32):
         super().__init__()
         self.every_n_epochs = max(int(every_n_epochs), 0)
         self.max_frames = max_frames
+        self.scan_batches = max(int(scan_batches), 1)
         self._x = None  # one fixed input frame-stack from the val set
 
     def _fixed_input(self, trainer):
         if self._x is None:
-            (x, _y) = next(iter(trainer.datamodule.val_dataloader()))
-            while isinstance(x, (list, tuple)):  # unwrap [(frames, t_rel)] -> frames
-                x = x[0]
-            # the first val crop is often bone-dry (-> an all-white plot); pick the
-            # wettest sample in the batch so the grid actually shows rain.
-            wettest = int(x.flatten(1).mean(1).argmax())
-            self._x = x[wettest:wettest + 1].clone()
+            # The val set is uniformly sampled from the raw LDCast index, which is
+            # ~65% bin-0 (essentially empty crops) -- a single batch often has no
+            # rain heavy enough to survive plot_precip_image's 0.1 mm/h mask, so
+            # the grid renders all-white. Scan up to scan_batches and keep the
+            # wettest crop across the whole scan; done once and cached.
+            best_x = None
+            best_score = -float("inf")
+            for bi, (x, _y) in enumerate(trainer.datamodule.val_dataloader()):
+                while isinstance(x, (list, tuple)):  # unwrap [(frames, t_rel)] -> frames
+                    x = x[0]
+                wet = x.flatten(1).mean(1)  # per-sample mean (normalised) rain
+                w_max, w_idx = float(wet.max()), int(wet.argmax())
+                if w_max > best_score:
+                    best_score = w_max
+                    best_x = x[w_idx : w_idx + 1].clone()
+                if bi + 1 >= self.scan_batches:
+                    break
+            self._x = best_x
         return self._x
 
     @torch.no_grad()

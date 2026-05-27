@@ -51,7 +51,7 @@ class SamplePredictionLogger(pl.Callback):
         (h, w) = (min(self.sample_hw, H), min(self.sample_hw, W))
         return t[..., (H - h) // 2:(H - h) // 2 + h, (W - w) // 2:(W - w) // 2 + w]
 
-    def _fixed_cases(self, trainer, scan_batches=32):
+    def _fixed_cases(self, trainer, scan_batches=64):
         if self._cases is None:
             # The leading val crops are often bone-dry (-> blank grids, undefined CSI).
             # Scan a bounded number of batches and keep the num_eval_cases with the

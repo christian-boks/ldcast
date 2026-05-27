@@ -286,3 +286,6 @@ You can find scripts for evaluating models in the `scripts` directory:
 * `eval_pysteps.py` to evaluate PySTEPS (requires pysteps installation)
 * `metrics.py` to produce metrics from the evaluation results produced with the functions in scripts above
 * `plot_genforecast.py` to make plots from the results generated
+
+
+sudo mount -t cifs //BOKS2/radar_data /mnt/radar_data -o username=christian
