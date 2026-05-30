@@ -187,7 +187,14 @@ class LatentDiffusion(pl.LightningModule):
         self.log("val_loss", loss, **log_params)
         self.log("val_loss_ema", loss_ema, **log_params)
 
-    def on_train_batch_end(self, *args, **kwargs):
+    def on_before_zero_grad(self, *args, **kwargs):
+        # Update the EMA shadow weights once per *optimizer* step. This hook
+        # fires after optimizer.step() and before zero_grad, i.e. once per
+        # accumulation cycle -- the previous on_train_batch_end ran the
+        # ~600-tensor EMA loop every microbatch, so with accumulate_grad_batches=16
+        # it updated the EMA 16x per actual weight change (15/16 on unchanged
+        # weights). Tying it to the optimizer step also makes the EMA decay
+        # track steps rather than microbatches.
         if self.use_ema:
             self.model_ema(self.model)
 

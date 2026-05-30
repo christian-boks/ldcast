@@ -56,7 +56,20 @@ def setup_genforecast_training(
         save_top_k=save_top_k,  # default 3; -1 keeps all. Each diffusion ckpt is ~6.3 GB.
         save_last=True,         # last.ckpt for clean resume (_resume_ckpt prefers it)
     )
-    callbacks = [checkpoint]
+    # Best-by-CSI checkpoint: the SamplePredictionLogger self.log's "val_csi"
+    # (EMA-eval'd csi_1.0mm/overall) every val epoch, so this keeps the single
+    # best-quality model -- the recency `checkpoint` above keeps "latest" for
+    # resume but never the best. Only fires on epochs where the monitor ran and
+    # logged val_csi; absent on epochs it didn't (Lightning skips cleanly).
+    checkpoint_csi = pl.callbacks.ModelCheckpoint(
+        dirpath=model_dir,
+        filename="best-{epoch}-{val_csi:.4f}",
+        monitor="val_csi",
+        mode="max",
+        save_top_k=1,
+        save_last=False,
+    )
+    callbacks = [checkpoint, checkpoint_csi]
     if early_stopping_patience and early_stopping_patience > 0:
         callbacks.append(pl.callbacks.EarlyStopping(
             "val_loss_ema", patience=early_stopping_patience,

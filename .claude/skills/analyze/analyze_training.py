@@ -35,14 +35,40 @@ STAGE_METRICS = {
 
 # Forecast-quality scalars logged by ldcast/models/genforecast/monitor.py once per
 # validation_epoch_end. CSI at three rain thresholds is the actual signal for diffusion
-# (val_loss_ema is eps-MSE and saturates early). Computed on a small fixed set of the
-# wettest val cases, so single epochs are noisy -- read the trend.
-QUALITY_METRICS = {
-    "diffusion": {
-        "csi": ["val/csi_0.1mm", "val/csi_1.0mm", "val/csi_5.0mm"],
-        "err": ["val/mae_mmhr", "val/rmse_mmhr"],
-    },
-}
+# (val_loss_ema is eps-MSE and saturates early). The monitor stratifies by LDCast
+# intensity bin (val/csi_<thr>mm/bin00..bin10) and also emits a count-summed overall
+# (val/csi_<thr>mm/overall). The /overall tag is what to lead with; per-bin is the
+# diagnostic for which intensity regime is improving.
+#
+# Legacy support: pre-2026-05-28 runs (version_0, version_1) used flat tag names
+# (val/csi_0.1mm) instead of /overall. Try the new names first, then fall back.
+CSI_THRESHOLDS = ("0.1", "1.0", "5.0")
+ERR_TAGS = ("mae_mmhr", "rmse_mmhr")
+
+
+def _resolve_quality_tags(data: dict) -> dict | None:
+    """Return {csi: [...], err: [...]} of tag names present in data, or None."""
+    if "val_rec_loss" in data:  # autoencoder; no quality metrics
+        return None
+    csi = []
+    for thr in CSI_THRESHOLDS:
+        overall = f"val/csi_{thr}mm/overall"
+        flat = f"val/csi_{thr}mm"
+        if overall in data:
+            csi.append(overall)
+        elif flat in data:
+            csi.append(flat)
+    err = []
+    for t in ERR_TAGS:
+        overall = f"val/{t}/overall"
+        flat = f"val/{t}"
+        if overall in data:
+            err.append(overall)
+        elif flat in data:
+            err.append(flat)
+    if not (csi or err):
+        return None
+    return {"csi": csi, "err": err}
 
 
 def trend_label(v: np.ndarray) -> tuple[float, float, str]:
@@ -194,18 +220,18 @@ def main():
             if t in data:
                 print(f"  {t}: {fmt(data[t][1])}")
 
-    quality = QUALITY_METRICS.get(stage)
-    if quality:
-        # The /analyze prompt notes: for diffusion, val_loss_ema is NOT a quality signal
-        # (it's eps-MSE; plateaus early). val/csi_*mm is. Lead with CSI when judging
-        # whether the run is getting better at forecasting rain -- especially csi_5mm
-        # for the LDCast sampler hypothesis (whether heavy-rain skill is improving).
-        print("\n--- QUALITY METRICS (val/csi_*, val/mae|rmse_mmhr — the real diffusion signal) ---")
-        csi_present = [t for t in quality["csi"] if t in data]
-        if not csi_present:
+    quality = _resolve_quality_tags(data) if stage == "diffusion" else None
+    if quality is not None:
+        # For diffusion, val_loss_ema is NOT a quality signal (it's eps-MSE; plateaus
+        # early). val/csi_*mm/overall is. Lead with CSI when judging whether the run
+        # is getting better at forecasting rain -- and use the per-bin breakdown below
+        # to diagnose WHICH intensity regime is improving (especially csi_5mm at
+        # heavy bins 8-10 for the LDCast sampler hypothesis).
+        print("\n--- QUALITY METRICS (val/csi_*mm/overall — count-summed across bins) ---")
+        if not quality["csi"]:
             print("  (no val/csi_* tags yet — first val epoch hasn't fired, or genforecast")
             print("   monitor disabled)")
-        for t in csi_present:
+        for t in quality["csi"]:
             _, v = data[t]
             best_i = int(v.argmax())  # CSI: higher is better
             slope, pct, lab = trend_label(v)
@@ -222,6 +248,64 @@ def main():
                 best_i = int(v.argmin())  # MAE/RMSE: lower is better
                 print(f"  {t}: per-epoch: {fmt(v, 4)}  "
                       f"best={v.min():.4f} @ ep {best_i}  latest={v[-1]:.4f}")
+
+        # Per-bin CSI table: compact "latest / best" per bin per threshold.
+        # Only show if the per-bin tags exist (new monitor; pre-2026-05-28 runs
+        # didn't emit them).
+        bin_tags = {thr: sorted(t for t in data
+                                if t.startswith(f"val/csi_{thr}mm/bin"))
+                    for thr in CSI_THRESHOLDS}
+        if any(bin_tags.values()):
+            print("\n--- PER-BIN CSI (latest / best across run) — diagnoses which intensity regime is improving ---")
+            print(f"  {'bin':<6} {'cases':<5} "
+                  f"{'csi_0.1mm':<14}  {'csi_1.0mm':<14}  {'csi_5.0mm':<14}")
+            # Find all bin indices present anywhere
+            bin_idxs = sorted({
+                int(t.rsplit("bin", 1)[1])
+                for thrtags in bin_tags.values() for t in thrtags
+            })
+            for b in bin_idxs:
+                cells = [f"bin{b:02d}", "", ]
+                for thr in CSI_THRESHOLDS:
+                    tag = f"val/csi_{thr}mm/bin{b:02d}"
+                    if tag in data:
+                        _, v = data[tag]
+                        cells.append(f"{v[-1]:.4f} / {v.max():.4f}")
+                    else:
+                        cells.append("  -    /   -   ")
+                print(f"  {cells[0]:<6} {cells[1]:<5} "
+                      f"{cells[2]:<14}  {cells[3]:<14}  {cells[4]:<14}")
+
+        # Per-lead-time skill (val/<m>_<thr>mm_lead/lt<NN>, added 2026-05-29).
+        # The pooled /overall numbers average strong near-term steps with weak
+        # late ones; this shows how skill decays with lead time. POD at 0.1mm is
+        # the "will I get wet" signal. Radar cadence is 10 min/step, so
+        # lt<NN> -> +(NN+1)*10 min. Single epochs are noisy, so report the mean
+        # of the last few epochs per lead.
+        if any("_lead/lt" in t for t in data):
+            lts = sorted({int(t.split("_lead/lt")[1]) for t in data if "_lead/lt" in t})
+            n_ep = max((len(data[t][1]) for t in data if "_lead/lt" in t), default=0)
+            kk = min(5, n_ep)
+
+            def _mean_last(tag, k=kk):
+                if tag not in data or len(data[tag][1]) == 0:
+                    return None
+                v = data[tag][1]
+                return float(v[-min(k, len(v)):].mean())
+
+            print(f"\n--- PER-LEAD-TIME skill (mean of last {kk} epochs; 10 min/step) ---")
+            print("    POD = fraction of rain caught (higher better); "
+                  "FAR = fraction of rain forecasts that were wrong (lower better)")
+            print(f"  {'lead':<8} {'POD0.1':<8} {'FAR0.1':<8} {'CSI0.1':<8} "
+                  f"{'POD1.0':<8} {'CSI1.0':<8}")
+            for lt in lts:
+                row = [f"+{(lt + 1) * 10}min"]
+                for m, thr in (("pod", "0.1"), ("far", "0.1"), ("csi", "0.1"),
+                               ("pod", "1.0"), ("csi", "1.0")):
+                    val = _mean_last(f"val/{m}_{thr}mm_lead/lt{lt:02d}")
+                    row.append(f"{val:.3f}" if val is not None else "  -  ")
+                print(f"  {row[0]:<8} {row[1]:<8} {row[2]:<8} {row[3]:<8} "
+                      f"{row[4]:<8} {row[5]:<8}")
 
     print("\n--- TRAIN LOSS (per-step, noisy; read the binned trend, not raw spikes) ---")
     if "train_loss" in data:

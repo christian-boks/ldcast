@@ -18,12 +18,21 @@ Usage (from this directory):
 import gc
 import os
 
+import torch
 from fire import Fire
 from omegaconf import OmegaConf
 
 from ldcast.features.rust_data import RustRadarDataModule
 
 from train_genforecast import setup_model
+
+# Training runs millions of fixed-shape steps, so let cuDNN pick the fastest
+# conv algos once and reuse them, and allow TF32 for the fp32 regions (the AFNO
+# spectral path self-casts to fp32). The first few steps are slightly slower
+# while cuDNN searches; amortized away over a full run. (Inference does the
+# opposite -- one unique-shape forward -- so predict_rust.py leaves these off.)
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
 
 
 def train(

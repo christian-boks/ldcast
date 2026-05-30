@@ -4,9 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-LDCast is a latent diffusion model (LDM) for precipitation nowcasting — same family of models as Stable Diffusion, but conditioned on past radar frames rather than text. The repo contains both the library (`ldcast/`) for using the model and the scripts (`scripts/`) used to train and evaluate it for the LDCast paper (https://arxiv.org/abs/2304.12891).
+LDCast is a latent diffusion model (LDM) for precipitation nowcasting — same family of models as Stable Diffusion, but conditioned on past radar frames rather than text. The repo contains both the library (`ldcast/`) for using the model and the scripts (`scripts/`) used to train and evaluate it for the LDCast paper (paper/ldcast-paper.pdf).
 
 When making changes to the code, update journal.md with what was changed and why it was changed. To keep track of what  we have tried and what the outcome was.
+
+
 
 ## Install (uv)
 
@@ -78,7 +80,7 @@ Shared building blocks are in `ldcast/models/blocks/`: `afno.py` (Adaptive Fouri
 ## Conventions worth knowing
 
 - Multi-GPU training: PyTorch Lightning trainers auto-pick a strategy when `torch.cuda.device_count() > 1` (see `models/autoenc/training.py` and `models/genforecast/training.py`). The hardcoded `strategy='dp'` is stale (see footguns above).
-- Checkpointing: both trainers keep the top-3 checkpoints by monitored metric (`val_rec_loss` for the autoencoder, `val_loss_ema` for the diffusion model) and early-stop with patience 6.
+- Checkpointing: the **autoencoder** trainer keeps the top-3 checkpoints by `val_rec_loss` and early-stops with patience 6. The **diffusion** trainer differs: it keeps the `save_top_k` (default 3) most-*recent* checkpoints (monitor=`step`, mode=max) plus `last.ckpt`, **and** a single best-by-CSI checkpoint (`best-{epoch}-{val_csi}.ckpt`, monitor=`val_csi` = the monitor's EMA-eval'd `csi_1.0mm/overall`, mode=max). Early-stopping is **disabled by default** (`early_stopping_patience: 0` in `config/train_rust.yaml`) because `val_loss_ema` (eps-MSE) doesn't track forecast quality; stop manually or via `max_hours`. There is also **no LR scheduler** on the diffusion model (ReduceLROnPlateau was removed; LR is constant).
 - Config files in `config/` are sparse OmegaConf YAMLs that only set overrides; the 128×128 config is intentionally empty (defaults), the 256×256 config bumps `sample_shape`, `batch_size`, `lr`, and points `initial_weights` at the 128×128 checkpoint for staged training.
 - Autoencoder training has a known instability: loss can go to NaN. Resume from the latest checkpoint with `--ckpt_path=...` (README notes this).
 

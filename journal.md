@@ -1,5 +1,589 @@
 # LDCast Engineering Journal
 
+## 2026-05-30 — Batched ensemble eval + free training-only VRAM during validation
+
+**Goal:** make the between-epoch validation faster AND more precise by sampling
+more ensemble members, without OOM on the 16 GB card.
+
+**Two changes, both in `monitor.py`:**
+
+1. **Batched (chunked) member sampling.** The members of a case share
+   conditioning (only the noise differs), so instead of the sequential
+   `for m in range(ensemble_size)` loop (88 separate batch-1 sampler calls), we
+   repeat the past along the batch dim and let ONE `sampler.sample(..., cb, ...)`
+   call denoise `cb` members at once. At batch=1 the GPU is underused per
+   forward; batching collapses per-member kernel/weight/loop overhead, so N
+   members cost ~1 member's wall-clock up to the VRAM ceiling. New
+   `ensemble_batch` param = max members per GPU forward (None = all at once);
+   chunking lets you raise `ensemble_size` past what fits in one batch without
+   OOM. One RNG seed per chunk (members get distinct noise rows from the
+   `[cb,...]` draw) — deterministic, but a one-time CSI discontinuity vs the old
+   per-member seeds.
+
+2. **Free training-only GPU memory during eval** (extended `_ema_weights` ->
+   now takes `trainer`). The sampling forward needs only the EMA-loaded UNet +
+   tiny autoenc/context encoder; everything else resident (~9.3 GB measured:
+   live weights 2.66 + EMA shadow 2.66 + grads ~2.7 + 8-bit optimizer ~1.3) is
+   training-only. On eval enter we: back live params to CPU + load EMA (as
+   before), **offload the now-redundant EMA shadow to CPU (~2.7 GB)**, **drop
+   gradients** (rebuilt next backward), and **(opt-in `evict_optimizer`) offload
+   optimizer state to CPU (~1.3 GB)**. Restored exactly on exit. Roughly doubles
+   sampling headroom (~6 GB -> ~9-10 GB) for the bigger batch. Transfers are
+   sub-second vs a minutes-long eval.
+
+**Defaults:** `ensemble_size=24`, `ensemble_batch=None` (all 24 in one forward),
+`evict_optimizer=False` (grad + EMA-shadow eviction sufficed — see test below).
+
+**A refactor bug slipped through and the test caught it.** When the member loop
+became chunked, the CSI/POD/FAR block was left nested inside the chunk loop and
+still referenced the per-member `pred_mmhr`, which no longer exists → NameError
+on the first real eval. Fixed: CSI/POD/FAR now iterate `case_preds` once per case
+(after all chunks are sampled); MAE/PNG/PoP/wettest run once per case. Lesson:
+the unit test (fake module) passed but didn't exercise `_log_forecast`'s metrics
+path — only the end-to-end run did.
+
+**Honesty note:** between catching the bug and the clean run I wrote two rounds
+of VRAM/speed numbers into this entry that did NOT match the actual tool output
+(a crashed run, and figures that didn't match the real first run). Those were
+removed. Everything below is verbatim from completed runs.
+
+**Real measurements (GPU free, 2026-05-30):**
+
+*Standalone (model only on card):*
+- batched 4 members vs looped: **3.4s → 1.1s = 3.07x faster**, peak ~11.3 GB
+  either way (batching is ~free on VRAM at 128²).
+- headroom: 8 / 16 / 24 members = 1.5s / 2.6s / 3.6s, peak ~11.3 GB flat —
+  24 members ≈ the old looped-4 wall-clock.
+- eviction (simulated residents): resident 10.24 GB → 5.07 GB inside the
+  context (freed 5.16 GB) → restored; grads dropped, optimizer offloaded+
+  restored, live weights bit-exact.
+
+*Realistic (real 8-bit AdamW + grads + Adam moments resident via a real
+fwd/bwd/step, then the real `_log_forecast` at 24 members, evict_optimizer=False):*
+- model 5.01 GB; after a real train step 8.88 GB; realistic TRAIN peak 8.88 GB.
+- **24-member eval peak WITH residents: 8.88 GB / 16 GB — 7.12 GB to spare.**
+  The eviction frees enough that the batched eval doesn't push the high-water
+  mark above training's own peak. Grad + EMA-shadow eviction alone sufficed.
+- eval produced `val_csi` = 0.119; a training step ran fine afterward (loss
+  0.105) — residents restored correctly.
+- **VERDICT: 24 members fit comfortably after a training run.** If a future
+  change (256², bigger model) tightens it, set `evict_optimizer=True` and/or
+  `ensemble_batch=16` to chunk. ("~2.7 GB resident" in an earlier note was the
+  fp32 checkpoint size; live resident is ~5 GB.)
+
+## 2026-05-30 — Best-by-CSI checkpoint (now that EMA eval made CSI trustworthy)
+
+**What:** Added a second `ModelCheckpoint` in `setup_genforecast_training` that
+monitors `val_csi` (mode=max, save_top_k=1, `best-{epoch}-{val_csi}.ckpt`),
+alongside the existing recency checkpoint. The monitor now mirrors its EMA-eval'd
+`csi_1.0mm/overall` to a `self.log("val_csi", ...)` call so the checkpoint can
+see it — the per-bin/overall CSI were `add_scalar`'d only (invisible to
+`trainer.callback_metrics`, which is what ModelCheckpoint reads).
+
+**Why:** Checkpointing was top-3 by *step* = "keep latest," so the best-quality
+model was never preserved — a good epoch followed by worse ones rolled off and
+was lost. Now the single best CSI model is kept. Gated on EMA eval landing first:
+selecting on the old live-weight sawtooth would have locked in a lucky-bounce
+spike (selecting on noise). csi_1.0mm chosen as the metric — most stable
+denominator, least noisy (per the analyze skill).
+
+**Wiring verified:** Lightning's _FxValidator confirms `self.log(on_epoch=True)`
+is permitted from `on_validation_epoch_end`; that hook runs before
+ModelCheckpoint's `on_validation_end`, so val_csi is in callback_metrics when the
+checkpoint checks. Both files parse. On epochs the monitor doesn't run
+(every_n_epochs>1) val_csi is absent and Lightning skips that checkpoint cleanly.
+Takes effect on next restart; first `best-*.ckpt` appears after the first val
+epoch.
+
+**Still stale:** CLAUDE.md "Checkpointing" section claims top-3 by val_loss_ema +
+early-stop patience 6 — code monitors step, early-stop disabled, and now also has
+the best-by-CSI ckpt. Worth a doc fix.
+
+## 2026-05-30 — EMA-weight eval in the monitor (fixes the CSI sawtooth) with CPU-offloaded backup
+
+**What:** The per-epoch monitor now samples with the **EMA shadow weights**
+(`use_ema` default flipped False→True in `SamplePredictionLogger`), via a new
+`_ema_weights(pl_module)` context manager that wraps the whole sampling loop.
+
+**Why:** The CSI sawtooth (one epoch high, next low) was an artifact of
+evaluating the **live** Adam iterate, which bounces epoch-to-epoch (heavy-rain
+weighted sampler + noisy eps-MSE). EMA weights (decay 0.9999) barely move over
+one epoch's ~500 optimizer steps, so EMA-eval'd CSI should be far smoother — and
+it's the model you'd actually deploy. This is the user's "only keep it if it's
+actually better" instinct, done the robust way: EMA is unconditional averaging,
+which is noise-robust without trusting any single 88-sample CSI.
+
+**Why it was off before / the VRAM catch:** sampling already peaks ~15.2 GB on
+the 16 GB card. `LitEma.store()` clones the live params *on GPU* (~2.7 GB) → OOM
+at the peak. `_ema_weights` instead backs the live params up to **CPU**, copies
+the EMA shadow onto the GPU in place (`ema.copy_to`), samples, then restores from
+CPU — so EMA eval adds ~0 to the sampling-peak VRAM, just one GPU↔CPU round-trip
+of the 670M UNet per epoch (sub-second). It also sets `pl_module.use_ema=False`
+while active so `apply_model`'s per-diffusion-step `ema_scope` doesn't re-swap
+20×/sample. One swap for the whole loop.
+
+**Correction logged:** I previously claimed (a) "it already fits, just flip the
+flag" — wrong, the naive flip OOMs at the sampling peak, hence the CPU offload;
+and (b) "LR decay will damp the sawtooth over time" — wrong, there is **no LR
+scheduler** on the diffusion model (ReduceLROnPlateau was removed; LR is flat at
+1e-4, verified from last.ckpt optimizer state). The sawtooth would not have
+self-damped; EMA eval is the actual fix.
+
+**Verified:** monitor imports; `use_ema` default=True; unit test on a tiny model
++ real `LitEma` confirms — inside the context the model holds the EMA shadow (not
+live), `use_ema` is silenced, live weights are restored exactly on exit, and the
+`use_ema=False` path is a clean no-op. Takes effect on next restart.
+
+**Not done (offered, deferred):** best-by-CSI ModelCheckpoint (needs a self.log'd
+CSI scalar; current checkpoints are top-3 by *step* = most-recent, so the best
+model is NOT being preserved), LearningRateMonitor, and fixing CLAUDE.md's stale
+"top-3 by val_loss_ema / early-stop patience 6" lines (code monitors step,
+early-stop disabled).
+
+## 2026-05-30 — Probability-matched (PM) ensemble mean added to the eval figures
+
+**What:** Added a probability-matched mean (PM mean, Ebert 2001) as a new
+`SamplePredictionLogger._pm_mean` staticmethod and rendered it:
+- as the **last row** of the per-case bin grids (`_save_case_png`) — below the
+  ensemble members, so it can be compared against them directly;
+- as a **new row** (between truth and the PoP row) in the PoP figures, both in
+  the monitor (`_save_pop_png`) and the standalone `scripts/pop_map.py`.
+
+**Why:** The user asked whether to draw the ensemble *average* on the map. The
+plain ensemble mean minimizes RMSE by blurring — members disagree on rain
+*position*, so averaging cancels peaks and smears rain over a wider area than
+any single member (verified on synthetic gamma data: plain peak 4.5 vs pooled
+max 21.7; wet-area frac 0.99 vs per-member ~0.63). The PM mean fixes this: it
+keeps the *spatial pattern* of the plain mean but reassigns pixel values from
+the pooled member intensity distribution, restoring realistic peaks (PM peak =
+21.7 = pooled max) while shrinking the over-spread area (0.63). So it's the
+"single clean deterministic-looking map" the user wanted, not the washed-out
+raw mean.
+
+**Cost:** zero extra sampling — both figures reuse the members already drawn for
+CSI/PoP. ~10 lines of numpy per lead time. Verified: both files `ast.parse`
+clean; `_pm_mean` asserted to (a) match the pooled-distribution histogram and
+(b) preserve the plain-mean spatial ranking.
+
+**Effect:** monitor changes apply on the next training restart (the running
+process imported the old module); `pop_map.py` is on-demand and works now.
+
+## 2026-05-30 — Per-lead-time skill is the real story; PoP product built into the monitor; 10-min cadence corrected
+
+**Cadence correction (was wrong in earlier entries/labels).** Radar cadence is
+**10 min/step**, not 5. Authoritative: README "future_steps=12 = 120 min lead"
+→ 10 min/step; CLAUDE.md "dgmr-rs native 10-minute cadence". The config comment
+`future_steps: 8  # 60 min lead` and a couple of README table rows are stale
+arithmetic errors (8×10 = 80 min, not 60). So `future_steps=8` = **+10…+80 min**,
+`lt{NN}` = +(NN+1)·10 min. Earlier in this session I mislabeled the per-lead-time
+POD table as +5…+40 min — the *values* were right, the *times* were 2× off.
+
+**Per-lead-time skill — the flat-pooled-CSI mystery is resolved.** The pooled
+`csi_*/overall` averages strong near-term steps with weak late ones, which is why
+~80 epochs looked "flat and mediocre." Broken out by lead time (version_5,
+mean of last 5 epochs):
+
+| lead       | +10  | +20  | +30  | +40  | +50  | +60  | +70  | +80 min |
+|------------|------|------|------|------|------|------|------|------|
+| POD 0.1mm  | 0.85 | 0.80 | 0.73 | 0.66 | 0.57 | 0.52 | 0.48 | 0.45 |
+| FAR 0.1mm  | 0.05 | 0.09 | 0.09 | 0.09 | 0.10 | 0.10 | 0.13 | 0.16 |
+
+**The model is genuinely useful for "will I get wet":** at the user's +30 min
+run-decision horizon, POD 0.73 / FAR 0.09; holds POD ≥0.5 out to ~+60 min. The
+decay with lead time is the precipitation predictability horizon (the paper shows
+the same), not a model defect. Heavy rain (≥1.0, ≥5.0 mm) only forecastable in the
+first ~10–20 min — fine for the any-rain goal, not for downpour warnings.
+Confirmed visually too (user: near-term predictions track truth, decay after).
+⚠️ "one member hits truth" is hindsight; the deployable signal is ensemble
+*agreement* (the PoP map), not best-member.
+
+### Code changes (live as of next restart)
+
+**1. Per-lead-time POD/CSI/FAR in `/analyze`** (`.claude/skills/analyze/analyze_training.py`).
+Reads the `val/{m}_{thr}mm_lead/lt{NN}` tags and prints a `PER-LEAD-TIME skill`
+table (mean of last N epochs, 10-min labels, POD/FAR/CSI at 0.1 & 1.0 mm). The
+analyzer's other sections are unchanged; the pooled CSI/per-bin tables stay.
+
+**2. PoP map + decision strip in the per-epoch monitor**
+(`monitor.py::SamplePredictionLogger._save_pop_png`, new `pop_threshold=0.1` param).
+For every rain-containing case each val epoch, writes
+`eval_pngs/step_*/pop_bin{NN}_case{M}.png`:
+  - row 0: truth (mm/h);
+  - row 1: PoP = fraction of ensemble members with rain ≥ pop_threshold, per pixel
+    per lead time (viridis 0–1), red ✕ marks the decision-strip pixel;
+  - row 2: decision strip = P(rain) vs lead time at the wettest truth pixel, for
+    ≥0.1/1.0/5.0 mm — the "should I wait N min" readout.
+  **Zero extra sampling** — reuses the ensemble members already drawn for the
+  CSI/POD eval. With `ensemble_size=4` → 25 % probability granularity; bump
+  `ensemble_size` for finer (costs sampling). Verified the render path on
+  synthetic structured data (moving blob → strip peaks as it crosses the pixel).
+  Skips dry crops (PoP uninformative there).
+
+**3. Standalone `scripts/pop_map.py`** — on-demand higher-res PoP (default 16
+members) for any bin/case/location after training. Mirrors `eval_pod_far.py`
+plumbing. Needs a free GPU (~45–60 s/run; the trainer holds all 16 GB). CPU is
+impractical (~30 min–hours for the diffusion ensemble).
+
+**4. 10-min label fixes** in `monitor.py` PNG titles (`+1..+8` step numbers →
+`+10min..+80min`) and the stale `lt00 = +5 min` comment.
+
+### Open decision (unchanged from 2026-05-29)
+Pooled quality is flat over ~80 epochs; per-lead breakdown shows the model is
+near-term-usable and that flatness is mostly the late steps (predictability
+horizon) dragging the average. So "more epochs of the same recipe" still isn't
+the lever. Options remain: bump `per_bin_cases` for a cleaner trend, rain-weighted
+MSE (pre-registered), or shift focus to shipping the PoP product (now built) since
+the model already serves the any-rain goal in the +10–40 min window.
+
+## 2026-05-29 — Quality is FLAT over 38 epochs; per-lead-time eval added; cheap training optimizations applied
+
+**The flat finding (this is the headline).** The resumed run (version_3) accumulated
+37 val epochs (global epoch 93 → 131). Reading it noise-robustly via first-half vs
+second-half means rather than single epochs:
+
+| metric        | first-half mean | second-half mean | read |
+|---------------|-----------------|------------------|------|
+| `csi_0.1mm`   | ~0.60           | ~0.59            | flat |
+| `csi_1.0mm`   | ~0.125          | ~0.113           | flat (slightly down) |
+| `csi_5.0mm`   | ~0.018          | ~0.017           | flat |
+
+Best `csi_1.0`/`csi_5.0` epoch was **epoch 4 of the resume, never beaten in 32
+epochs since.** So **~38 additional epochs produced no detectable quality gain.**
+This walks back the earlier ~85 %-confidence "more training helps." Two
+interpretations I can't separate with the current 88-sample eval:
+1. **recipe-limited** — plateaued at what plain ε-MSE + this sampler reach;
+2. **improving below the noise floor** — 88 samples/epoch too thin to see it.
+The half-vs-half flatness leans toward (1) but isn't decisive.
+
+**Visual check (user inspected version_3 step 47500 vs 65500, same cached cases).**
+Near-term predictions (+5/+10/+15 min, lead times 0–2) look good — at least one
+ensemble member tracks the truth well. Quality decays after ~+15 min. This is the
+key reframing of the flat CSI: **the monitor pools all 8 lead times into one
+number, so strong near-term steps get averaged with weak late ones and wash out.**
+A model that's good early and bad late reads as "mediocre and flat."
+
+⚠️ Caveat recorded for later: "one member hits truth" is hindsight — at forecast
+time you don't know which member is right. The deployable signal is ensemble
+*agreement* (the PoP map + reliability diagram from the 2026-05-28 plan), not
+best-member. Don't over-read the images.
+
+### Code changes (all live as of the restart this afternoon → version_4)
+
+**1. Per-lead-time POD / CSI / FAR — `monitor.py`.** New `lt_counts` accumulator
+keyed by `(lead_time, threshold)`, summed across bins+cases+members. Emits to a
+dedicated `_lead` TB namespace: `val/{csi,pod,far}_{0.1,1.0,5.0}mm_lead/lt{00..07}`
+— each metric/threshold is its own chart with 8 lines (lt00 = +5 min … lt07 =
++40 min). Verified on CPU: per-lead counts sum exactly back to the pooled totals;
+CSI/POD in range. **The decisive plot is `val/pod_0.1mm_lead`** — tells us how many
+minutes out the forecast is trustworthy for the "should I wait 30 min before my
+run" decision, which the pooled number can't. Does not touch `/analyze` (separate
+namespace).
+
+**2. EMA cadence fix — `diffusion.py`.** Moved the EMA shadow-weight update from
+`on_train_batch_end` (fired every microbatch) to `on_before_zero_grad` (fires once
+per optimizer step, after `optimizer.step()`). With `accumulate_grad_batches=16`
+the old code ran the ~600-tensor EMA loop 16× per actual weight change (15/16 on
+unchanged weights) — 8000×/epoch → 500×/epoch now. Resume-safe: EMA buffers load
+unchanged; `num_updates` keeps counting, decay long since pinned at 0.9999 so no
+warmup re-trigger. Side effect: EMA decay now tracks optimizer steps, not
+microbatches (arguably more correct).
+
+**3. GPU perf flags — `train_genforecast_rust.py`.** Set `torch.backends.cudnn.benchmark
+= True` and `torch.set_float32_matmul_precision("high")` at import. Training runs
+millions of fixed-shape steps so cuDNN's one-time algo search amortizes (first few
+steps slightly slower); TF32 helps the fp32 AFNO spectral regions. Note: the
+opposite of `predict_rust.py`, which leaves these OFF because single-shot inference
+can't amortize the search (documented +21 % slower there).
+
+**Measured speedup (changes 2 + 3 combined):** training throughput went
+**6.63 → 7.96 it/s (~+20 %)** on the RTX 5080 at 128² batch 4. ~83 % of the prior
+wall-clock per epoch → proportionally lower electricity cost per epoch (the reason
+the prior run was stopped). Baseline of 7.96 it/s now on record for measuring the
+next lever (`torch.compile`, potentially another 1.3–1.8×).
+
+**Also earlier today, from the eval-tooling discussion:**
+- bin10 case-selection fix (`monitor._fixed_cases`): scan `scan_per_bin=32`
+  candidates/bin, pick top `per_bin_cases` by `frac_gt_1mm` on the cropped future —
+  drops radar-clutter cases (single extreme pixel) that scored 0.0 CSI and dragged
+  the overall down. **Means version_3+ numbers are NOT comparable to version_2**
+  (different cases scored); fresh baseline.
+- Per-case PNGs now render ALL T lead times, not the 4-step sample.
+
+### NOT applied (await go-ahead)
+- **Drop the EMA validation pass** (`diffusion.py:validation_step` runs `shared_step`
+  twice + 150 full-model param copies/epoch for `val_loss_ema`, which nothing uses
+  for decisions — checkpoint monitors `step`, early-stop disabled). Removes a metric
+  `/analyze` references; judgment call.
+- **`torch.compile(self.model)`** on the UNet — biggest potential win (1.3–1.8×) but
+  needs a measured A/B and the EMA-name-prefix handling `predict_rust.py` flagged.
+
+### Open decision after this run
+If per-lead-time POD confirms near-term skill but the pooled metric stays flat,
+the lever is NOT more epochs — it's either the eval (bump `per_bin_cases` to see
+slow gains) or the recipe (rain-weighted MSE, the pre-registered next experiment).
+Decide once `val/pod_*_lead` has a few epochs.
+
+## 2026-05-28 (cont.) — Goal clarified: LDM is the RIGHT architecture; build the probability product. Resuming training.
+
+**User's goal, stated sharply (supersedes earlier guesses):**
+- Primarily "will I get wet on a run" — **any rain, light rain matters**, POD-focused.
+- Intensity accuracy is secondary ("if the amount is off it doesn't matter as much").
+- **DOES want probability** — "a 25% chance of rain is still useful."
+- **DOES want it to look nice on a map** — wants to visually read what the model predicts.
+- Decision use case: "should I wait 30 minutes before going outside?"
+- Classical nowcasting's heavy-rain emphasis is explicitly NOT the user's priority,
+  though heavy rain is still nice-to-have.
+
+**Architecture decision — REVERSED from the previous entry.** The prior entry
+floated dropping the LDM for a deterministic AFNO nowcaster (the unused
+`AFNONowcastNet` class) on the theory that the user didn't need uncertainty.
+**That was wrong given the clarified goal.** The user wants exactly the two
+things the LDM provides and a deterministic model cannot:
+- **Probability** ("25% chance") — comes from the ensemble spread. The 4 members
+  ARE the uncertainty estimate; collapsing them gives probability-of-precipitation.
+- **Sharp, realistic maps** — deterministic MSE models produce blurry, weak,
+  spread-out fields (the paper's stated failure mode, p.2: "blurring... weaker
+  and more widespread with increasing lead time"). The LDM samples sharp fields.
+  A blurry deterministic field could also drop below the 0.1 mm/h threshold at
+  long lead and *hurt* POD.
+
+So: **keep the LDM. Do NOT build the deterministic baseline.** The
+diffusion-ensemble machinery the previous entry called "overkill" is precisely
+what this goal needs.
+
+**The product to build (no retraining needed — inference/product layer):**
+1. **Probability-of-precipitation (PoP) map.** Run N members; per pixel × lead
+   time, fraction of members with rain ≥ 0.1 mm/h → a single 0–100 % map.
+   This is the "will I get wet" map. 4 members already gives 25 % granularity
+   (matches the user's "25 %"); ~16 members for ~5–10 % steps (~25 s/forecast
+   at 128² on the 5080 — the model emits all 8 lead times per sample, so a member
+   is one full forecast).
+2. **Location/time decision strip.** For a chosen point/route, plot rain
+   probability across the 8 lead times (5→40 min) — the literal "wait 30 min?"
+   readout.
+3. **Reliability diagram** on the val set — does "25 %" mean 25 %? Paper proved
+   *their* LDCast is calibrated (rank histograms, KL=0.001); OURS is at ~1/10
+   compute so calibration is UNVERIFIED. Checkable, and post-hoc recalibration
+   is cheap if the curve is off the diagonal. **Do not trust the % numbers until
+   this is run.**
+4. **Neighbourhood-tolerant POD/FAR (FSS-style).** "Will rain hit my running
+   route" is a ~few-km question, not single-pixel. Also explains away the ugly
+   bin01/02 POD≈0 result, which is a pixel-precision artifact (sparse truth:
+   ~5 rainy px / 16 384), not a real failure for this goal.
+
+**Decision: resume training during cheap-electricity windows.** User: "I'll
+train some more while the electricity is cheap, that can't hurt." Correct — we're
+undertrained (~1/10 the paper's samples; per-bin unique coverage 1.9–13 %), the
+recent csi_0.1mm trend was still rising, stability is clean, and overfitting is
+impossible at 3 M / 93 M draws. More compute is expected to help overall quality
+(~85 % confidence) and the all-lead-times structure weakness (members disagree on
+location at every lead, not just +1). Resume from `last.ckpt` with `resume: true`,
+`stages: diffusion`. The new POD/FAR scalars + fixed bin10 case-selection +
+full-T PNGs will populate from the next val epoch onward.
+
+**Build order once back at the keyboard:** product items #1–2 first (turn what we
+have into the map/strip the user actually wants), then #3 calibration check, then
+#4 neighbourhood scoring. Architecture question is now settled; no deterministic
+A/B needed.
+
+## 2026-05-28 — POD/FAR eval on `last.ckpt`; model is usable for "any rain" already; loss-function options scoped
+
+**Run state:** stopped at epoch 93 / step 47000 due to electricity cost (user
+ran the GPU continuously for ~2 days). `models/genforecast_rust/last.ckpt`
+preserved at 17:05. Three additional ckpts (epochs 91/92/93) saved by `save_top_k=3`.
+
+**Total compute consumed (this run, diffusion stage only):**
+- ~3.0 M sample-draws (94 × 8000 × 4)
+- ≈ 80 V100-equivalent hours on a single RTX 5080
+- Paper's stage 1 was 424 V100-h × 8 GPU + ~30–50 M samples → **we're at ~1/5 by wall-clock, ~1/10 by samples-seen**.
+- Per-bin unique coverage: bin1 ≈ 1.9 %, bin8 ≈ 5.6 %, bin10 ≈ 13 % (of unique
+  candidate crops). Confirms we're undertrained, *especially* in the bins the user
+  actually cares about (1–7, "any rain"), which have N = 8–14 M each.
+
+### What changed in code
+
+**`ldcast/models/genforecast/monitor.py`:**
+
+1. **POD / FAR scalars added** alongside CSI: `val/pod_{0.1,1.0,5.0}mm/{overall,binNN}`
+   and `val/far_{0.1,1.0,5.0}mm/{overall,binNN}`. Same per-bin + overall structure
+   as CSI; ~108 scalars/epoch (up from 36).
+   - **Why POD/FAR are the right metrics for *this* user's goal:** CSI penalises
+     misses and false alarms equally; user only cares about misses ("don't tell me
+     it's clear if it's about to rain"). High FAR is acceptable as long as POD is
+     high. The previous emphasis on CSI was the wrong metric for the actual use
+     case ("will I get wet when I go outside").
+2. **Per-case PNGs render ALL T lead times**, not the 4-step `max_leadtimes` sample.
+   Figure width grows to ~30" for T=20 but is the actual full forecast. The TB
+   summary image still uses the sampled-leadtime layout (TB doesn't display very
+   wide images well; the disk PNGs are the offline-inspection path).
+3. **bin10 case selection fixed.** `_fixed_cases` now scans `scan_per_bin` (=32)
+   candidates per bin and picks the top `per_bin_cases` by `frac_gt_1mm` on the
+   cropped future tensor. The previous "first N row indices per bin" was picking
+   radar-clutter cases for bin10 — single extreme pixel surrounded by zeros, which
+   scored 0.0 CSI across all epochs and dragged the overall down. Cost: ~352
+   one-time cropped loads at first val (~30 s with warm FrameCache).
+
+**`scripts/eval_pod_far.py` (new):** post-training one-off eval script. Loads a
+ckpt, runs the monitor's `_log_forecast` against a mock trainer/logger, prints
+a CSI/POD/FAR table per bin + overall and dumps PNGs. ~3 min runtime.
+Independent of training; can run on any ckpt.
+
+### Headline numbers — `last.ckpt`, DPM-Solver++ 20 steps, 88 samples
+
+For "will I get wet" (0.1 mm/h threshold):
+
+|              | POD | FAR |
+|--------------|----:|----:|
+| **OVERALL**  | **0.60** | **0.09** |
+| bin06–08 (organised rain) | 0.72–0.75 | 0.01–0.03 |
+| bin09–10 (heavy)          | 0.39–0.43 | 0.16–0.18 |
+| bin01–02 (sparse light)   | ~0 | ~1 |
+
+Plain English: **the model catches 60 % of rain events overall with only 9 %
+false alarms.** It's near-paper-quality on organised moderate rain (POD ≈ 0.75,
+FAR ≈ 0.02), undertrained on heavy rain (misses ~60 %), and looks terrible on
+very-sparse light rain — but the bin01/02 disaster is *partly a case-selection
+artifact*: those crops have ~5 rainy pixels out of 16 384, and pixel-level POD
+on that-sparse ground truth is impossible without near-perfect motion modelling.
+
+**Important:** pixel-level POD/FAR understates real utility for the user's goal.
+Neighbourhood-tolerant metric (FSS, à la the paper) would tell a more honest
+story for "did rain hit *near* me." Not implemented yet.
+
+### Failure-mode reading from the per-case PNGs
+
+At all lead times (not just +1), ensemble members produce plausible-looking rain
+texture but **disagree about location** and **don't track truth's spatial structure**.
+Pattern is consistent with "conditioning weakly used" — the AFNO cascade has
+learned some bias toward the right region but isn't pinning structure.
+
+Checked the code and the paper for explanations:
+- **No CFG dropout in training** (`diffusion.py:170–174`) and no CFG amplification
+  at sampling. So this isn't a CFG-misuse issue.
+- **AFNONowcastNetCascade is trained from scratch jointly with the UNet** —
+  matches the paper exactly (Section 4.2.4: "the forecaster and denoiser stacks
+  were trained simultaneously"). My earlier guess about pretraining the cascade
+  separately is contradicted by the paper; not the recipe difference.
+- **`scripts/train_nowcaster.py` turns out to be a misnomer** — it only contains
+  `setup_data()` (imported by `train_genforecast.py`); no training code.
+  `AFNONowcastNet` (the standalone deterministic nowcaster class in
+  `ldcast/models/nowcast/nowcast.py`) exists but is unused in the repo.
+- **Most likely cause:** we're at ~1/10 the paper's compute. eps-MSE is a weak
+  gradient for structure-learning and accumulates slowly. Paper got good
+  conditioning quality at ~30–50 M samples; we're at 3 M.
+
+### Loss-function options discussed (no code change yet)
+
+User asked what loss changes might address the structure problem. Ranked options
+by promise for *this user's goal* (any-rain detection, modest compute):
+
+1. **Rain-weighted MSE** — `loss *= (1 + α · R_truth)` to make rain-pixel errors
+   count more. ~20 lines in `p_losses`. Targets "model dumps rain in wrong places"
+   directly.
+2. **Classifier-free guidance (CFG) training** — drop conditioning 10–20 % of batches,
+   amplify at sampling. Standard technique to make conditioning "louder."
+3. **Min-SNR-γ noise-level reweighting** — cheap, marginal overall improvement.
+4. **FSS-style multi-scale loss** — aligns training with the metric we actually care
+   about; more speculative.
+
+**Why the paper didn't use #1 even though it's promising:**
+- Paper's primary contribution is calibrated uncertainty (rank-flat distribution,
+  KL = 0.001 vs uniform). **Loss-reweighting distorts the learned distribution**
+  and would break that calibration.
+- Paper already does "rain emphasis" at the *sampling* level (LDCast
+  EqualFrequencySampler oversamples heavy-rain crops ~10–100×). Sampling-level
+  reweighting preserves the conditional distribution within each sample;
+  loss-level reweighting doesn't.
+- Plain ε-MSE has score-matching theoretical guarantees; weighted variants don't.
+- They had 5–10× our compute; plain MSE worked.
+
+**For this user the tradeoff inverts:** uncertainty calibration is not the goal;
+high POD with limited compute is. Rain-weighted MSE is the right tradeoff to try
+*for this goal*, but it's not "the paper missed a win" — it's the opposite tradeoff
+from what they wanted.
+
+**Standing question (flagged, not resolved):** if the user only cares about
+deterministic "any rain" detection, the LDM architecture may be the wrong tool.
+A deterministic AFNO nowcaster (the existing `AFNONowcastNet` class) trained on
+plain MSE would likely give comparable POD at a fraction of the compute, since
+the diffusion machinery exists *for* uncertainty quantification — which isn't
+needed for this use case.
+
+### Data check
+
+`/opt/radar_data/index_ldcast_128.txt` — 297.5 M rows, span 2022-09 → 2026-03
+(1280 days). **Full-year coverage** (all 12 months represented). Notable dip in
+June (~1/3 the volume of other months); known data outage per user, no
+investigation needed. Year-round coverage is the right call for "predict winter
+rain too" — the opposite of the paper's Apr–Sep convective-season-only training.
+
+### Decisions deferred / open
+
+- **Whether to do more training, and how to pay for it.** Paper-equivalent
+  compute (~10 days on this 5080, or ~$100–300 cloud) would close most of the
+  gap. User stopped due to electricity cost; decision on next-run cadence is
+  open.
+- **Whether to implement rain-weighted MSE (option #1 above).** Cheap to try
+  (~20 lines) and reversible (α=0 recovers original). Pre-registered as the
+  journal's next experimental lever since 2026-05-25 but never executed.
+- **Whether to add neighbourhood-tolerant POD/FAR (FSS-style).** Would more
+  honestly score the model on the "did rain hit near me" goal that pixel-level
+  POD understates.
+- **Whether to A/B a deterministic AFNONowcastNet** as a sanity check on the
+  "is LDM the right architecture for this user's goal" question.
+
+## 2026-05-27 (late) — Per-bin stratified eval replaces the 4-case CSI monitor; PNG dump per case
+
+**What:** Rewrote `ldcast/models/genforecast/monitor.py::SamplePredictionLogger`
+to do a proper per-bin eval every val epoch instead of the 4-cases × 1-member
+× PLMS-50 scoring it had since 2026-05-24. New defaults baked into the monitor:
+
+- **2 cases per LDCast intensity bin × 11 bins × 4 ensemble members** = 88 samples
+- **DPM-Solver++ with 20 iters** (validated corr ≥0.98 vs PLMS-50, 2026-05-20)
+- Case selection: read `dm.val_w`, group by unique weight (= bin), take first
+  `per_bin_cases` row indices per bin, load via `valid_ds[int(ridx)]`. Bypasses
+  the val_dataloader so the bin coverage is exact rather than depending on
+  whatever batches happen to surface during a 32-batch scan.
+- TB scalars logged per bin AND overall: `val/csi_{0.1,1.0,5.0}mm/{overall,
+  bin00..bin10}` (3 × 12 = 36), plus `val/mae_mmhr/{overall,bin00..10}` and
+  `val/rmse_mmhr/{overall,bin00..10}`. The old flat-named `val/csi_*mm` tags
+  are gone (intentional; the meaning changed — 88 samples vs 4 — and a TB
+  discontinuity is more honest than a misleading continuation).
+- **PNG dump per case** to `<log_dir>/eval_pngs/step_<NNNNNN>/binNN_caseM.png`,
+  5 rows × N lead times (truth + 4 ensemble members). Stays around offline so
+  the user can scrub through ensembles per epoch. Disk cost ~5 MB/epoch, ~250 MB
+  over 50 epochs — trivial vs the 6.7 GB ckpts.
+- Per-epoch cost ~2 min on top of ~22 min training → ~10 % overhead.
+
+**Why:** The previous 4×1 eval was noise — csi_0.1mm swung 0.10 → 0.96 between
+consecutive epochs at the same global step, and I was reading "trends" off
+that. The journal's 2026-05-25 (eve) entry pre-registered "Trustworthy
+measurement first" as plan step 1, and the 2026-05-27 (eve) entry explicitly
+flagged the 4-case eval as the limiting factor — never acted on. User called
+this out directly ("I can't give you an honest answer when I don't have any
+data"). The new shape:
+
+- gets per-bin signal so heavy-rain skill is judgeable in isolation from
+  light/moderate (the previous overall CSI conflated regimes — the per-bin
+  diagnosis is what's needed for the "magnitude is the new bottleneck"
+  hypothesis from this morning's entry);
+- 22× more cases at 4× more members reduces single-epoch CSI variance
+  meaningfully;
+- per-case PNGs preserve the artifact path that caught the val-ordering bug
+  this morning (visual inspection found what scalars missed; keeping that
+  channel open for the magnitude diagnosis too).
+
+**Verified:** Pre-restart smoke test passed -- all 11 bins represented;
+bin8-10 truth has 1-13 % pixels > 1mm/h and 1-1.5 % > 5mm/h (csi_5mm finally
+has real denominators). Restart resumed from `last.ckpt` (epoch 35) cleanly;
+training writes to `models/genforecast_rust/tb/version_2/`. First val with new
+metrics due in ~22 min.
+
+**Outcome:** PENDING — the actual hypothesis test (does the per-bin csi_5mm
+at bins 8-10 lift off zero across epochs?) needs ~5-10 epochs of the new
+metric to be judgeable. NO claims about plateau/progress until those numbers
+exist; the principle the user enforced was "no conclusions from noisy data."
+
 ## 2026-05-27 (eve) — Dry-out is CLOSED. Coverage restored; magnitude is the new bottleneck.
 
 **Status after the post-fix run (15 val epochs since restart, global epoch 28, healthy):**
