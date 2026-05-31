@@ -204,10 +204,21 @@ class LDCastEqualFrequencySampler(Sampler[int]):
 
 
 # ---- DataModule -------------------------------------------------------------
-def _load_ldcast_index(path: str, valid_frac: float, seed: int):
+def _load_ldcast_index(path: str, valid_frac: float, seed: int,
+                       test_frac: float = 0.0, split_mode: str = "random"):
     """Parse + split + bin-0-dedup the LDCast index file.
 
-    Returns ((train_ts, train_x, train_y, train_w), (val_ts, val_x, val_y, val_w)).
+    Returns three (ts, x, y, w) tuples: (train, val, test). `test` is empty
+    unless test_frac > 0.
+
+    split_mode:
+      "temporal" -- hold out whole UTC days, so no timestamp is shared across
+        train/val/test. A random per-crop split LEAKS: crops at the same
+        timestamp (overlapping 128^2 windows) and at +-10 min (highly
+        correlated radar) would straddle the boundary, making val/test
+        optimistic. The LDCast paper splits by whole days for this reason.
+      "random" -- legacy per-crop permutation split (fast, leaky; kept for
+        reproducing earlier runs).
 
     Bin-0 entries (essentially-empty 128x128 crops; rain99 < 0.2 mm/hr) are the
     most populous bucket -- ~65% of the new index -- and are functionally
@@ -230,19 +241,40 @@ def _load_ldcast_index(path: str, valid_frac: float, seed: int):
         raise RuntimeError(f"no entries parsed from {path}")
 
     rng = np.random.default_rng(seed)
-    perm = rng.permutation(n_total)
-    n_valid = int(round(n_total * valid_frac))
-    # Do NOT sort val_idx: the LDCast indexer emits all spatial positions per
-    # timestamp consecutively, so a sorted val slice clusters into a handful of
-    # adjacent timestamps -- val_dataloader's first ~200 samples ended up from a
-    # single 10-min radar snapshot, badly skewing val_loss_ema, the cached eval
-    # cases, and CSI. Permuted order spreads val uniformly across the index.
-    # train_idx stays sorted because the LDCast sampler picks rows randomly,
-    # so order doesn't matter for training -- and sorted indices are friendlier
-    # to anything that scans train_ts/x/y linearly.
-    val_idx = perm[:n_valid]
-    train_idx = np.sort(perm[n_valid:])
-    del perm
+    # In both modes: train_idx is kept ASCENDING (the index is emitted in
+    # timestamp order, so ascending train stays ~time-sorted, which the LDCast
+    # sampler doesn't care about and linear scans prefer). val_idx/test_idx are
+    # SHUFFLED, never sorted: the indexer emits all spatial positions per
+    # timestamp consecutively, so a sorted val/test slice clusters into a few
+    # adjacent timestamps -- val_dataloader's first ~200 samples once all came
+    # from a single 10-min snapshot, badly skewing val_loss_ema and the cached
+    # eval cases. Shuffling spreads them across the held-out set.
+    if split_mode == "temporal":
+        day = ts // 86400                       # whole UTC day per crop
+        uniq = np.unique(day)
+        rng.shuffle(uniq)
+        n_test_d = int(round(uniq.size * test_frac))
+        n_val_d = int(round(uniq.size * valid_frac))
+        test_days = uniq[:n_test_d]
+        val_days = uniq[n_test_d:n_test_d + n_val_d]
+        test_mask = np.isin(day, test_days)
+        val_mask = np.isin(day, val_days)
+        train_idx = np.flatnonzero(~(test_mask | val_mask))
+        val_idx = np.flatnonzero(val_mask); rng.shuffle(val_idx)
+        test_idx = np.flatnonzero(test_mask); rng.shuffle(test_idx)
+        del day, uniq, test_mask, val_mask
+    elif split_mode == "random":
+        perm = rng.permutation(n_total)
+        n_test = int(round(n_total * test_frac))
+        n_valid = int(round(n_total * valid_frac))
+        test_idx = perm[:n_test]
+        val_idx = perm[n_test:n_test + n_valid]
+        train_idx = np.sort(perm[n_test + n_valid:])
+        del perm
+    else:
+        raise ValueError(
+            f"unknown split_mode {split_mode!r}; use 'temporal' or 'random'"
+        )
 
     train_ts = ts[train_idx]
     train_x = x[train_idx]
@@ -252,7 +284,11 @@ def _load_ldcast_index(path: str, valid_frac: float, seed: int):
     val_x = x[val_idx]
     val_y = y[val_idx]
     val_w = w[val_idx]
-    del ts, x, y, w, train_idx, val_idx
+    test_ts = ts[test_idx]
+    test_x = x[test_idx]
+    test_y = y[test_idx]
+    test_w = w[test_idx]
+    del ts, x, y, w, train_idx, val_idx, test_idx
 
     w_min = train_w.min()
     bin0_mask = train_w == w_min
@@ -267,7 +303,11 @@ def _load_ldcast_index(path: str, valid_frac: float, seed: int):
             [train_w[keep], np.array([w_min * bin0_pop], dtype=train_w.dtype)]
         )
 
-    return (train_ts, train_x, train_y, train_w), (val_ts, val_x, val_y, val_w)
+    return (
+        (train_ts, train_x, train_y, train_w),
+        (val_ts, val_x, val_y, val_w),
+        (test_ts, test_x, test_y, test_w),
+    )
 
 
 class RustRadarDataModule(pl.LightningDataModule):
@@ -284,6 +324,8 @@ class RustRadarDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         cache_capacity: int = 64,
         valid_frac: float = 0.1,
+        test_frac: float = 0.0,
+        split_mode: str = "random",
         seed: int = 42,
         use_weighted_sampler: bool = False,
         max_nocoverage_frac: float = 0.05,
@@ -304,16 +346,17 @@ class RustRadarDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.cache_capacity = cache_capacity
         self.valid_frac = valid_frac
+        self.test_frac = test_frac
+        self.split_mode = split_mode
         self.seed = seed
         self.use_weighted_sampler = use_weighted_sampler
         self.max_nocoverage_frac = max_nocoverage_frac
 
-        (self.train_ts, self.train_x, self.train_y, self.train_w), (
-            self.val_ts,
-            self.val_x,
-            self.val_y,
-            self.val_w,
-        ) = _load_ldcast_index(index_path, valid_frac, seed)
+        (
+            (self.train_ts, self.train_x, self.train_y, self.train_w),
+            (self.val_ts, self.val_x, self.val_y, self.val_w),
+            (self.test_ts, self.test_x, self.test_y, self.test_w),
+        ) = _load_ldcast_index(index_path, valid_frac, seed, test_frac, split_mode)
 
     def _ds(self, ts, x, y):
         return RustRadarDataset(
@@ -332,6 +375,8 @@ class RustRadarDataModule(pl.LightningDataModule):
     def setup(self, stage=None):
         self.train_ds = self._ds(self.train_ts, self.train_x, self.train_y)
         self.valid_ds = self._ds(self.val_ts, self.val_x, self.val_y)
+        self.test_ds = (self._ds(self.test_ts, self.test_x, self.test_y)
+                        if self.test_ts.size else None)
 
     def _collate(self, samples):
         past = torch.stack([s[0] for s in samples], dim=0)
@@ -409,3 +454,10 @@ class RustRadarDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         return self._loader(self.valid_ds, None, shuffle=False)
+
+    def test_dataloader(self):
+        if getattr(self, "test_ds", None) is None:
+            raise RuntimeError(
+                "no test split; set split_mode='temporal' and test_frac>0"
+            )
+        return self._loader(self.test_ds, None, shuffle=False)

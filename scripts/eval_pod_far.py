@@ -64,6 +64,7 @@ def run(
     eval_seed=1234,
     scan_per_bin=32,
     out_dir=None,
+    split="val",
 ):
     if not os.path.isfile(ckpt):
         sys.exit(f"checkpoint not found: {ckpt}")
@@ -94,10 +95,18 @@ def run(
         batch_size=cfg.genforecast_batch_size,
         num_workers=0,            # no training, no loader workers needed
         valid_frac=0.1,
+        test_frac=cfg.get("test_frac", 0.0),
+        split_mode=cfg.get("split_mode", "random"),
         seed=42,
         use_weighted_sampler=cfg.use_weighted_sampler,
     )
     dm.setup("fit")
+    if split == "test":
+        if dm.test_ds is None:
+            sys.exit("no test split in this config; set split_mode=temporal and test_frac>0")
+        # the monitor scores dm.valid_ds / dm.val_w, so point them at the test set
+        dm.valid_ds, dm.val_w = dm.test_ds, dm.test_w
+        print("Evaluating on the held-out TEST split.")
 
     print("Building model...")
     ldm, _ = setup_model(

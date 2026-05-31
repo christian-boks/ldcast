@@ -145,6 +145,8 @@ def run(
     early_stopping_patience: int = 6,
     sample_every_n_epochs: int = 1,
     use_weighted_sampler: bool = False,
+    split_mode: str = "random",
+    test_frac: float = 0.0,
 ):
     """Run the autoencoder and/or diffusion stages per the config (see module docstring)."""
     valid_stages = ("both", "autoenc", "diffusion")
@@ -181,6 +183,8 @@ def run(
             f"--sample_every_n_epochs={sample_every_n_epochs}",
             f"--early_stopping_patience={early_stopping_patience}",
             f"--use_weighted_sampler={use_weighted_sampler}",
+            f"--split_mode={split_mode}",
+            f"--test_frac={test_frac}",
         ]
         if limit_train_batches is not None:
             cmd.append(f"--limit_train_batches={limit_train_batches}")
@@ -230,6 +234,8 @@ def run(
             f"--sample_every_n_epochs={sample_every_n_epochs}",
             f"--early_stopping_patience={early_stopping_patience}",
             f"--use_weighted_sampler={use_weighted_sampler}",
+            f"--split_mode={split_mode}",
+            f"--test_frac={test_frac}",
         ]
         if limit_train_batches is not None:
             cmd.append(f"--limit_train_batches={limit_train_batches}")

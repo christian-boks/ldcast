@@ -1,5 +1,149 @@
 # LDCast Engineering Journal
 
+## 2026-05-31 — Large held-out eval (660 cases x 32 members): heavy rain weak everywhere, no usable regime, PoP needs recalibration
+
+**What:** New `scripts/eval_val_large.py` — a one-off, cross-case-batched eval
+(packs case x member slots to fill VRAM; ~2x the monitor's throughput; incremental
+finalize so RAM stays bounded). EMA weights, 20 DPM-Solver++ steps,
+`split_mode=random` = the current model's TRUE held-out 10% (leakage accepted).
+660 cases (60/bin) x 32 members = 21k samples, ~55 min. Metrics: per-bin CSI/POD/
+FAR + bootstrap CIs, per-lead, PM-mean, CRPS, season, per-case distribution, PoP
+sweep, reliability, FSS. Artifacts in `models/genforecast_rust/val_large_eval/`.
+
+**Headline (tight CIs):** overall `csi_0.1 = 0.495 [0.474-0.517]`,
+`csi_1.0 = 0.128 [0.117-0.140]`, `csi_5.0 = 0.014 [0.011-0.018]`. So the monitor's
+noisy heavy-rain ~0.01 is **real, not measurement noise.** (POD 0.56/0.14/0.01.)
+
+**Five findings:**
+1. **Heavy rain is weak at every measurement.** point CSI 0.014; FSS at the largest
+   neighbourhood (51 px) only 0.059 (vs the paper's ~0.7 at 10 mm/50 km — but the
+   DMI px->km spacing is unconfirmed); per-lead heavy CSI gone after +10 min; PoP
+   operating curve maxes POD ~0.08. Neighbourhood tolerance lifts `csi_5` ~4x
+   (0.014->0.059) but nowhere near useful. The "point CSI is lying" hope is closed.
+2. **No bimodality / no hidden good regime.** per-case `csi_1` distribution is a
+   single spike at ~0 (345/660 cases) + decaying tail; p95 = 0.23, only 2% > 0.3.
+   The pooled skill is concentrated in the wettest cases but even those top out
+   ~0.2-0.3. "Find the regime where it works and ship that" is off the table.
+3. **Season = climatology, confirmed.** light rain identical warm=cold (0.50);
+   moderate 1.6x better in warm (0.148 vs 0.092); heavy too sparse in cold to
+   measure (cold `csi_5`=0.006 on a near-empty denominator). So all-year does NOT
+   dilute heavy rain — heavy rain is intrinsically a warm-season event; the winter
+   use-case (light rain) is served equally year-round. Gating to summer would only
+   cost winter coverage. Settles the all-year question.
+4. **It's a short-range light-rain nowcaster — which is the user's actual goal.**
+   per-lead `csi_0.1` 0.75->0.33 over +10-80 min (useful to ~+40-60 min); PoP curve
+   dials POD up to 0.95 at FAR 0.34. PM-mean beats individual members at every
+   threshold (`csi_0.1` 0.53). CRPS = 0.43 mm/h.
+5. **PoP is badly miscalibrated but trivially fixable.** reliability bows far above
+   the diagonal — forecast "20%" actually verifies at ~50-70% (systematic
+   under-forecast / under-dispersion). Smooth + monotonic, so a one-shot post-hoc
+   isotonic recalibration makes "30% mean 30%". This is the pre-registered product
+   item #3, now shown both NECESSARY and cheap — the highest-value next step for the
+   probability product (no retraining).
+
+**Caveat:** random split is leaky (neighbour crops), so absolute numbers are mildly
+optimistic — the heavy-rain weakness holds *despite* that (leakage flatters).
+
+## 2026-05-31 — Temporal (by-day) train/val/test split + held-out test set, to kill leakage
+
+**What:** Added a `split_mode: temporal` option (and a `test_frac`) that holds out
+whole UTC days into val/test instead of the old random per-crop split. Wired end
+to end: `_load_ldcast_index` (rust_data.py) → `RustRadarDataModule`
+(`test_ds`/`test_dataloader`) → both stage scripts → `train_rust.py` orchestrator
+→ `config/train_rust.yaml` (now `split_mode: temporal`, `test_frac: 0.1`) →
+`eval_pod_far.py --split=test`.
+
+**Why:** The split was `rng.permutation` over individual `(ts,x,y)` crops, so crops
+at the **same timestamp** (overlapping 128² windows) and at **±10 min** (highly
+correlated radar) straddled the train/val boundary → val/test were leaky and
+optimistic, and not comparable to the paper (which splits by whole UTC days for
+exactly this reason). There was also **no test set** at all.
+
+**How:** temporal mode computes `day = ts // 86400`, shuffles unique days, assigns
+whole days to test/val/train. `train_idx` stays ascending (≈time-sorted, sampler
+doesn't care, friendlier to scans); `val_idx`/`test_idx` are shuffled (a sorted
+slice clusters into a few adjacent timestamps — the 2026-05-27 val-ordering bug).
+bin-0 dedup stays train-only. `_load_ldcast_index` now returns 3 tuples.
+Back-compat: everything defaults to `split_mode="random", test_frac=0.0`; only the
+config opts in. The monitor evaluates `dm.valid_ds`, so `eval_pod_far --split=test`
+just points `valid_ds/val_w` at the test set.
+
+**Verified on the real 297M-row index** (`split_mode=temporal, valid_frac=0.1,
+test_frac=0.1, seed=42`): **day overlap train∩val = train∩test = val∩test = 0**
+(leakage gone). 80/10/10 by *day* (766/96/96 of 958 days-with-data — note: not the
+1280 calendar-day span; outages). 11 bins present in each split. Train bin-0 dedup
+intact: random-mode train = 93,589,944 = the unchanged pre-split number; temporal
+train = 82.5M (consistent with deduping ~155M empties out of the 80% slice). Row-%
+is 58/21/21 not 80/10/10 only because train dedupes bin-0 while val/test keep the
+natural ~65%-empty distribution — by raw index val and test are each ~10%.
+
+**Honest correction to the prior turn:** I'd said this was "no retraining needed to
+just measure the current model." **Wrong.** The current checkpoint trained on the
+random 90%, which overlaps *every* day, so it is contaminated on any temporal
+holdout — there is no clean held-out data for it. The clean generalization number
+comes only from the **next training run using the temporal split**: then the
+monitor's `val/csi_*` is a clean signal automatically, and `test` is reserved for a
+final one-shot `eval_pod_far --split=test`. Pairs naturally with the rain-weighted-
+loss A/B — run that on the temporal split and the clean number falls out for free.
+The autoencoder is left on the old split (frozen, only supplies latents; the
+ceiling test showed it isn't the bottleneck).
+
+## 2026-05-31 — Autoencoder reconstruction-ceiling test: AE is NOT the heavy-rain bottleneck
+
+**What:** New one-off `scripts/eval_autoenc_ceiling.py` (no training, no diffusion).
+It encode→decodes the ground-truth FUTURE field through the frozen stage-1 AE
+(posterior MEAN = best-case, noise-free round-trip) and scores it with the SAME
+cases (`monitor._fixed_cases`) and SAME CSI/POD/FAR math as the in-training
+monitor — so the numbers are directly comparable to `val/csi_*mm/overall`. The
+diffusion model decodes through this same AE, so the AE's own round-trip is a
+hard upper bound on the whole pipeline.
+
+**Why:** Resolve the weeks-old hypothesis (carried since 2026-05-27 "Dry-out is
+CLOSED") that the AE clips/smooths heavy-rain peaks and caps `csi_5` regardless
+of diffusion quality. This gates the pre-registered rain-weighted-loss
+experiment: if the AE were the ceiling, a diffusion-side loss change would be
+futile. Run on `last.ckpt` (epoch 234) with the GPU free (training stopped).
+
+**Result — the AE round-trips heavy rain almost perfectly. Hypothesis FALSIFIED.**
+
+| metric (overall) | AE recon ceiling | diffusion pipeline | model is at |
+|---|---|---|---|
+| `csi_0.1mm` | 0.997 | ~0.66 | 66% of ceiling |
+| `csi_1.0mm` | 0.950 | ~0.10 | ~10% of ceiling |
+| `csi_5.0mm` | **0.895** | **~0.011** | **~1% of ceiling** |
+
+- Per heavy bin, recon `csi_5`: bin07 0.79, bin08 0.86, bin09 0.89, **bin10 0.94**
+  (POD 0.98 / FAR 0.04). The low bins' `csi_5` (bin00 0.19, bin03 0.00) is noise —
+  near-zero 5 mm denominators; the heavy bins carry the count-summed overall.
+- **Peaks are preserved, not clipped:** mean 99.9th-pct truth 9.39 → recon 9.58
+  (×1.02); mean max 17.23 → recon **21.67 (×1.26 — slight overshoot)**. Recon
+  MAE 0.051 mm/h, RMSE 0.214 mm/h. Per-lead recon `csi_5` flat 0.86–0.92 across
+  all 8 leads (no temporal-boundary degradation).
+- Visual (`models/genforecast_rust/autoenc_ceiling/recon_bin10_case0.png`):
+  truth and AE-recon rows are indistinguishable, heavy cores included.
+
+**Conclusion:** the heavy-rain (and moderate-rain) bottleneck is the **diffusion
+model's generation**, not the latent space or decoder. The frozen AE hands the
+diffusion model a latent space fully capable of `csi_5 ≈ 0.9`; the model is
+generating latents that decode to `csi_5 ≈ 0.011`. The intensity-graded shortfall
+(66% → 10% → 1% of ceiling as the threshold rises) is the signature of plain
+ε-MSE under-producing rare high-magnitude latents.
+
+**This de-risks the pre-registered rain-weighted diffusion loss** (the journal's
+deferred lever since 2026-05-25): there is now confirmed headroom (the decoder
+can express heavy rain), so a loss that pushes the UNet to actually place heavy
+rain has a real target. **Expectation-setting (honest):** the *reconstruction*
+ceiling (0.9) is NOT the *forecast* ceiling — predictability caps real gains, and
+the per-lead-time data shows heavy rain is only forecastable in the first
+~10–20 min. So rain-weighted loss should lift near-term heavy/moderate CSI, not
+take `csi_5` to 0.9. Secondary diffusion-side contributors worth a cheap check:
+20→50 sampler steps at val (current 20 = slightly blurrier) and no CSI-time CFG.
+NOT an AE retrain — that lever is now closed.
+
+**Caveat:** used posterior mean (`sample_posterior=False`) for the ceiling; a
+posterior *sample* (matches the train loss) is the `--sample_posterior=True`
+flag, but the 80× gap is not a close call — sampling noise won't move 0.9→0.01.
+
 ## 2026-05-30 — Batched ensemble eval + free training-only VRAM during validation
 
 **Goal:** make the between-epoch validation faster AND more precise by sampling

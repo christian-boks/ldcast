@@ -24,6 +24,15 @@ index_path: /opt/radar_data/index_ldcast_128.txt
 # index; sampling proportional to weight makes every LDCast intensity bin equally likely per draw.
 use_weighted_sampler: true
 
+# Train/val/test split. temporal = hold out whole UTC days so no timestamp is
+# shared across splits — a random per-crop split LEAKS (same-timestamp crops and
+# ±10 min frames straddle the boundary, inflating val/test). The LDCast paper
+# splits by whole days for this reason. valid_frac stays at the stage default
+# (0.1); test_frac carves an additional held-out set never trained or validated
+# on. Set split_mode: random to reproduce pre-split runs.
+split_mode: temporal
+test_frac: 0.1
+
 # --- where checkpoints go ---
 autoenc_dir: ../models/autoenc_rust
 genforecast_dir: ../models/genforecast_rust
