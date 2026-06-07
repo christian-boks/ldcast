@@ -18,6 +18,7 @@ def setup_model(
     use_nwp=False,
     nwp_input_patches=4,
     num_nwp_vars=9,
+    use_checkpoint=False,
     lr=1e-4,
     precision=None,
     optimizer_8bit=False,
@@ -71,7 +72,8 @@ def setup_model(
         model_channels=256, out_channels=autoencoder_obs.hidden_width,
         num_res_blocks=2, attention_resolutions=(1,2), 
         dims=3, channel_mult=(1, 2, 4), num_heads=8,
-        num_timesteps=num_timesteps, context_ch=analysis_net.cascade_dims
+        num_timesteps=num_timesteps, context_ch=analysis_net.cascade_dims,
+        use_checkpoint=use_checkpoint,
     )
 
     (ldm, trainer) = training.setup_genforecast_training(

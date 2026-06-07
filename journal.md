@@ -1,5 +1,554 @@
 # LDCast Engineering Journal
 
+## 2026-06-03 (cont.) — nowcaster-rs: Python-free Rust production deployment of the 256² prob-nowcaster (built + validated)
+
+**What:** built `/home/christianhansen/github/nowcaster-rs/` — a standalone Rust crate
+mirroring `ldpredict`, for Python-free production inference of the 256²-context
+prob-nowcaster (tch-rs + libtorch 2.12+cu130; reads radar .img → writes PoP .img).
+
+**Pieces:**
+- `export/export_torchscript_prob.py`: traces ProbNowcastNet (256² ctx ckpt epoch24)
+  → `model.pt` (**8.2 MB** vs the LDM's 2.7 GB). Bakes the input transform
+  (log/z-norm/antialias — cross-checked vs ldcast `Antialiasing`, max|diff| 7e-7) +
+  sigmoid + centre-crop. Contract: `forward(past_mmhr [1,1,4,256,256]) → PoP
+  [3,8,128,128]`. Single forward — no sampler/x_T/ensemble (vs the LDM export).
+  Reused the LDM export's JIT export-probe guard (AE LightningModule `.trainer` raises
+  under `module_has_exports`).
+- `src/main.rs`: reads 4 past .img over a 256² window centred on the target (at
+  x−64,y−64), one forward, writes u8 PoP .img per (threshold,lead):
+  `pop{0.1,1.0,5.0}_t{10..80}.img`. byte = round(prob*254); 255 = no-coverage. .img
+  read / geo-bbox / CUDA force-link mirror ldpredict.
+
+**Validated end-to-end:** built in 32s; ran on GPU (forward **0.38s**, 24 files). Rust
+output vs Python `torch.jit.load(model.pt)` on the IDENTICAL frames: **max|diff|
+0.0020** (u8-quantization-limited), mean 0.0003; threshold monotonicity
+P(≥0.1)≥P(≥1)≥P(≥5) holds. Frame-convention confirmed by anchor sweep: nowcaster
+`--timestamp`=NOW (newest past) reads [NOW−30..NOW] = `load_sample(index_ts=NOW−30)`
+(only the 13:00 anchor aligned at 0.002; others ~0.16) → the binary feeds the model
+its exact training input.
+
+**⚠ Output encoding:** reuses the RIMG .img container but the u8 byte is PROBABILITY
+(`prob = byte/254`), NOT dBZ — consumers must decode as byte/254, not Marshall-Palmer.
+Deploy: ship binary + model.pt + matching libtorch (set LD_LIBRARY_PATH + DGMR_RADAR_ROOT).
+Re-export after any retrain (`export_torchscript_prob.py`).
+
+## 2026-06-03 (cont.) — GROWTH/DECAY (obj 4): the 256² core has real skill; context turns much "genesis" into forecastable development
+
+**Result** (`eval_growth_decay.py`, `growth_decay.png`; 400 paired Aalborg test cases;
+256 core vs 128 vs persistence; vetted genesis/decay masks, single-vector advection).
+
+GENESIS (Brier-BSS vs Eulerian; POD@0.5 256/128; mean PoP forms-vs-dry, 256):
+| thr | BSS256 | POD 256 / 128 | PoP forms / dry |
+|---|---|---|---|
+| 0.1 | +0.582 [.46,.67] | **0.48 / 0.05** | 0.48 / 0.06 |
+| 1.0 | +0.307 | 0.19 / 0.07 | 0.28 / 0.05 |
+| 5.0 | +0.101 | 0.03 / 0.01 | 0.10 / 0.01 |
+
+DECAY (Brier-BSS vs Lagrangian; clearing-POD; mean PoP cleared-vs-stayed, 256):
+| thr | BSS256 | clearPOD 256/128 | PoP cleared / stayed |
+|---|---|---|---|
+| 0.1 | +0.471 | 0.58 / 0.52 | 0.44 / 0.93 |
+| 1.0 | +0.623 | 0.72 / 0.69 | 0.33 / 0.74 |
+| 5.0 | +0.879 | 0.98 / 0.98 | 0.09 / 0.38 |
+Per-lead 1mm: genesis BSS ~+0.30 flat; decay ~+0.62 flat across +10-80min.
+
+**Verdict — obj 4 SATISFIED:** the 256² nowcaster genuinely predicts growth AND decay,
+beating persistence/advection decisively, with clear discrimination (more PoP where
+rain forms, much less where it clears), holding across all leads.
+
+**Key update — genesis is LESS radar-blind than the 128-model read claimed.** 256²
+genesis POD 0.48 vs 128's 0.05 @0.1mm (~9×). The genesis set is defined by CRUDE
+single-vector advection + dist-from-echo INSIDE the 128² crop; the 256² model sees the
+64px collar, so much "genesis" is development/ARRIVAL with precursors just outside the
+small crop — forecastable from the wider field, NOT truly novel formation. A large part
+of the earlier "growth gap" was a small-crop + crude-advection artifact, now closed by
+context. The genuinely-novel formation (no precursor anywhere) is the smaller residual.
+→ **Weakens the journal's 2026-06-01 "strongest case for NWP":** context already
+captured much of the growth gap, so NWP's marginal value (true initiation w/ no radar
+precursor) is smaller than thought. Tilts the decision toward shipping the 256² product.
+[[project-temperature-conditioning-shelved]]
+**Caveat:** high-thr decay clearPOD (0.98@5mm) partly inflated by intensity timidity
+(under-produces 5mm → predicts dry → "catches" clearing by default); but the
+discrimination gap (0.09 cleared vs 0.38 stayed) shows real skill even there.
+
+**Eyes-on refinement (`panel_growth_decay.py`, `example_{growth,decay}.png`).** User:
+"your examples don't look like growth/decay" — correct, the pixel-mask + max-count
+selection picked big *advecting* systems. Reselected for LOW-MOTION (|v|<5px/step)
+IN-PLACE area change. On clean cases: **DECAY is a clean, real win** — truth area
+0.13→0.00, the model's PoP-area tracks it to zero (slightly early, timidity), Lagrangian
+stays flat (fails). **GROWTH is real but PARTIAL** — truth area explodes 0.08→0.95
+in place; the model rises well above flat Lagrangian (it senses growth) but undershoots
+hard (~0.30 vs 0.95). So on *true in-place convective initiation* the model only
+partially anticipates — consistent with that being the genuine radar-blind residual /
+narrow NWP frontier, while the aggregate genesis POD 0.48 was inflated by
+arrival/development cases the wider field already reveals.
+
+## 2026-06-03 (cont.) — 3-way A/B VERDICT: context SATURATES at 256² for the use case; 384² only helps long-lead light rain
+
+**Result** (`eval_prob_ctx3.py`, `ctx3_ab.png`; 400 paired Aalborg test cases,
+interior, IDENTICAL centre-128 ground; 384 = epoch-25 best val_brier 0.0150, plateaued).
+
+Overall interior Brier:
+| thr | 128 | 256 | 384 | 256→384 |
+|---|---|---|---|---|
+| 0.1 | 0.0984 | 0.0755 | 0.0720 | +0.0035 [+.001,+.006] (384 edges, long-lead-driven) |
+| 1.0 | 0.1460 | 0.1284 | 0.1294 | −0.0010 [−.004,+.002] (tie) |
+| 5.0 | 0.0220 | 0.0213 | 0.0241 | −0.0029 [−.004,−.002] (256 better) |
+
+**Per-lead (0.1mm) shows a CROSSOVER:** 384 slightly WORSE at +10/+20 (0.038/0.052 vs
+256's 0.035/0.050 — far collar dilutes the near field), BETTER at +50-80 (0.084/0.114
+vs 0.091/0.130 — captures fast far inflow), crossing ~+30-40min. Same shape at 1.0mm;
+at 5mm 384 is worse throughout.
+
+**Verdict:** for the primary objective (rain/no-rain at +30-40min) context is TAPPED
+OUT at 256² — 384 ≈ 256 at the decision horizon, slightly worse at short leads + heavy
+rain. 384's only real gain is +50-80min LIGHT rain (secondary regime). **256² is the
+sweet spot.** The earlier val_brier (0.0150 vs 0.0143) read "worse" because it's
+dominated by the short-lead dilution + 5mm loss, masking the long-lead light gain.
+Geometry vindicated: the 64-128px far collar = rain >70min upstream, irrelevant to
++30-40min and dilutive near-field. Training stopped at plateau (epoch 29, saved ~3h).
+
+→ **Context lever is DONE — adopt 256² as the core.** Remaining frontier: NWP/temperature
+for genesis (the radar-blind gap nothing here touches) [[project-temperature-conditioning-shelved]],
+or build the calibrated point/path PoP product on the 256² model.
+
+## 2026-06-03 (cont.) — pushing context further: 384² training launched (3-way 128/256/384 A/B pending)
+
+**Why:** 256² (64px collar) already covers the MEDIAN case to ~+74min (motion
+8.7px/step), so its only remaining gap is FAST movers (p90 17.6px/step) at long
+leads: 256² covers p90 to +36min, **384² (128px collar) to +73min**. So 384² is the
+definitive "is context saturated?" test — expect the 256→384 gain to be smaller than
+128→256 and concentrated in fast cases at +40-80min.
+
+**Feasibility (measured, 5080):** 384²/B4 = 12.0 GB (B3 9.1), fits; Aalborg windows
+stay **100% on-radar at pad=128** (no data loss). 320² also fits (B6 12.6) but skipped
+— 256² already covers the median, so went straight to 384².
+
+**Launched (bg, `bfxr93wl1`):** `models/prob_nowcaster_aalborg_ctx384`, input_pad=128
+output_crop=128 batch_size=4 accum=4 (eff batch 16), same Aalborg temporal recipe,
+max_hours=12. ~15min/epoch est (384² ≈ 2.25× the 256² compute/sample); 256² converged
+~epoch 24 (768k samples) → expect ~12h. best-by-val_brier + last.ckpt each epoch.
+
+**Pending:** generalise `eval_prob_ctx_ab.py` to a 3-way (128 vs 256 vs 384) paired
+A/B on identical centre-128 ground, per-lead. If 384 ≈ 256 → context saturated →
+NWP/temperature lever next. Then ping the user.
+
+## 2026-06-03 — CONTEXT A/B VERDICT: 256² input beats 128² at every lead; the gain GROWS with lead (inflow hypothesis confirmed)
+
+**Result** (`eval_prob_ctx_ab.py`, 400 wettest Aalborg test cases, **paired** — both
+models scored on IDENTICAL centre-128 ground; ctx256 = epoch-24 best-by-val_brier
+0.0143). ctx256 training stopped at convergence (val_brier flat 0.0143-0.0144 from
+epoch 24; was at epoch 32, killed to save compute).
+
+| thr | prob256 (ctx) | prob128 (base) | Δ(base−ctx) [95% CI] |
+|---|---|---|---|
+| 0.1 | **0.0755** | 0.0984 | +0.0230 [+.0168,+.0298] |
+| 1.0 | **0.1284** | 0.1460 | +0.0176 [+.0146,+.0207] |
+| 5.0 | **0.0213** | 0.0220 | +0.0008 [+.0005,+.0011] |
+
+Context wins at every threshold, **disjoint paired-bootstrap CIs**. Overall interior
+Brier −23% (0.1mm), −12% (1.0mm).
+
+**Per-lead is the tell — the gain GROWS with lead, tracking the inflow fraction:**
+0.1mm Δ = +0.005(+10) … +0.018(+30) +0.026(+40) … +0.041(+80). At +10min the curves
+nearly coincide (no inflow near-term); they fan apart as more of the 128² domain
+becomes unseen inflow (21% @+30, 27% @+40, 55% @+80). **The inflow hypothesis is
+confirmed mechanistically, not just on aggregate.** `ctx_ab.png`, `ctx_ab.json`.
+
+**Verdict:** the spatial-context lever is real and on-objective — at the +30-40min
+decision horizon the ctx model cuts centre-128 Brier ~20-25% (0.1mm) / ~12% (1.0mm).
+The cheap radar-side win the diagnosis predicted: no NWP, no arch change, just a
+wider input crop (input_pad=64) supervising the centre. Also lowered val_brier
+0.0172→0.0143 vs the 128 baseline. Converged ~epoch 24, ~13min/epoch.
+
+**Honest scope:** wettest Aalborg cases only (selection bias unchanged from the prior
+evals); a 256² window still leaves the fastest movers (p90 ~70px > 64px margin)
+partly inflow-limited at the longest leads — a further dial to 320²/384² if wanted.
+Genesis stays radar-blind (the NWP lever, untouched).
+
+→ Open next steps: (a) push context further (320²), (b) the NWP/temperature lever for
+genesis, or (c) adopt ctx256 as the core prob-nowcaster. [[project-temperature-conditioning-shelved]]
+
+## 2026-06-02 (cont.) — larger-context lever IMPLEMENTED (256² input → 128² target); ctx256 training running, paired A/B pending
+
+**What:** built + launched the spatial-context experiment (the lever the inflow
+diagnosis pointed to). **No architecture change** — AFNO mixes spatially via global
+FFT, so centre pixels already see the whole input; just feed more and supervise the
+centre.
+- **`rust_data.py` `input_pad`** (new param, dataset + datamodule): loads a
+  (height+2·pad)² window CENTRED on the catalog crop (load at x−pad, y−pad) instead
+  of height². pad=64 → 256² input around each 128² Aalborg crop. **No 256² index
+  needed** (none exists — only the 12 GB index_ldcast_128.txt); reuses the 128
+  catalog. VERIFIED byte-exact: centre-128 of the 256² window == the standalone 128²
+  crop (max|Δ|=0 over all 12 frames) → the A/B is **perfectly paired** (identical
+  target, wider input only). Region filter / bin weights untouched (key off the crop
+  centre, unchanged).
+- **`prob_nowcast.py` `output_crop`** (new): centre-crops logits+targets to
+  output_crop² before BCE/Brier — supervise/score only the context-complete centre.
+- **`train_prob_nowcaster_rust.py`**: wired both params.
+- VRAM (measured, 5080, bf16 fwd+bwd): 256²/B8 ≈ 10.7 GB (B16 OOMs; B4 5.4 GB) →
+  recipe **B8 + accum2** (eff. batch 16, matches the 128 baseline).
+
+**Training (RUNNING, background):** `models/prob_nowcaster_aalborg_ctx256`,
+input_pad=64 output_crop=128 batch_size=8 accum=2, same Aalborg temporal
+split/sampler/region as the 128 baseline, max_hours=8. **~13 min/epoch (5 it/s).**
+Baseline converged ~epoch 30 → expect ~6.5 h. best-by-`val_brier` + `last.ckpt`
+saved each epoch. **Resume:** relaunch the same cmd with
+`--ckpt_path=…/prob_nowcaster_aalborg_ctx256/last.ckpt` (Lightning restores
+epoch/opt/LR/EMA/step; granularity = last completed epoch). Use `.venv/bin/python`,
+NOT `uv run` (it wipes the maturin `dgmr_py`).
+
+**PENDING — paired A/B (`scripts/eval_prob_ctx_ab.py`, written + import-verified):**
+per test case loads a 128² window (truth + baseline input) AND the 256² window
+centred on it (ctx input); runs both models; crops ctx output to centre 128²;
+interior-scores both on IDENTICAL ground (overall + per-lead). Headline Q: does the
+wider input recover the 21–27% inflow Brier gap at +30–40 min (leads 2–3)? **Run
+after training (from scripts/, NOT uv run):**
+`DGMR_RADAR_ROOT=/opt/radar_data ../.venv/bin/python eval_prob_ctx_ab.py --prob256_ckpt=<best ctx256 ckpt>`
+→ then **ping the user** with the verdict (they asked to be notified when results land).
+
+## 2026-06-02 (cont.) — FAIR-INTERIOR verdict: the prob-nowcaster BEATS pysteps STEPS on probability; "advection is better" was a CSI/inflow artifact
+
+**What:** completed the interior-fair comparison (user's choice over the full
+re-eval). Added a forecaster-agnostic INTERIOR mask (pixel scored at lead k only if
+its advective source pos−motion·(k+1) was inside the crop at t0 — single global
+vector, same basis as the genesis/decay masks) to `eval_steps_baseline.py`, and
+scored the prob-nowcaster on the IDENTICAL mask via `eval_prob_interior.py` (one
+forward/case, no diffusion). Cross-checks all **Δ0.00000**: prob full-domain Brier
+== ab_eval/summary.json; eul/lag_sv full + eul interior match between the two
+scripts → identical cases AND pixels. STEPS = pysteps STEPS ensemble (dense LK +
+6-cascade + stochastic), 32 members, timestep 10min, kmperpixel 2.0 (guess; only
+scales stochastic spread).
+
+**FAIR-INTERIOR Brier (BSS vs Eulerian-interior, 400 wettest Aalborg test cases):**
+
+| thr | STEPS | lag_lk (LK adv) | prob-nowcast | eul |
+|---|---|---|---|---|
+| 0.1 | 0.287 (−0.365) | 0.327 (−0.555) | **0.098 (+0.532)** | 0.210 |
+| 1.0 | 0.213 (+0.265) | 0.264 (+0.090) | **0.146 (+0.497)** | 0.290 |
+| 5.0 | 0.024 (+0.417) | 0.032 (+0.229) | **0.022 (+0.471)** | 0.042 |
+
+STEPS BSS CI: 0.1 [−0.52,−0.24], 1.0 [+0.22,+0.30], 5.0 [+0.37,+0.46] — disjoint
+from prob at 0.1 & 1.0mm.
+
+**Verdict — REVERSES the "advection beats the nowcaster" read:**
+- "advection is better" was a **CSI** (deterministic detection) result + the
+  full-domain inflow confound. On the **probabilistic** question (Brier = the actual
+  "chance of rain" product), the prob-nowcaster beats the operational gold-standard
+  STEPS **decisively at 0.1 & 1.0mm** (disjoint CIs) and ties at 5mm, on identical
+  fair-interior pixels. The nowcaster did NOT fail at its real job.
+- STEPS is even WORSE than Eulerian at 0.1mm interior (−0.365): on near-saturated
+  scenes its stochastic spread hurts the "is it raining at all" question. The 0.1mm
+  win for prob is partly the learned wet prior on the 39% saturated cases; the
+  cleaner discrimination win is **1.0mm: prob +0.497 vs STEPS +0.265**.
+- **Remaining hard problems are UNIVERSAL, not model failures:** genesis POD ≈ 0 for
+  ALL methods incl. STEPS (0.1/1/5mm prob .055/.070/.011, STEPS .033/.022/.002) →
+  radar-blind, needs NWP. Boundary inflow 21–27% at +30–40min → needs larger context.
+
+**Caveats:** wettest cases only (interior fix removes the inflow confound, NOT the
+selection bias — a representative sample is the deferred "full fair re-eval"). 0.1mm
+dominance partly the saturation prior. kmperpixel=2.0 a guess, but the gap is large
+and lag_lk (km-invariant) is also far behind → robust to it.
+
+**→ The prob-nowcaster is the right probabilistic core — now confirmed against the
+gold standard, not just the diffusion model. The two levers to push "will it rain"
+further are both quantified: (1) larger spatial input context (inflow), (2)
+NWP/temperature conditioning (genesis).** `eval_prob_interior.py`,
+`eval_steps_baseline.py` (interior), `ab_eval/{prob_interior,steps_summary}.json`.
+
+## 2026-06-02 — pysteps STEPS wired as the honest bar; it exposed that the wettest-case A/B is confounded (saturation + boundary inflow)
+
+**Why:** the user rejected the journal's optimistic "prob wins" framing — "the
+diffusion model kinda failed, and the nowcaster also failed since plain Lagrangian
+advection was actually better." Field-generation losing to advection at short lead
+is the EXPECTED nowcasting result; the A/B's Brier "win" pitted a hedged
+probability against a 0/1 persistence (a weak bar). So we wired the operational
+gold-standard advection ensemble (pysteps STEPS) to score the SAME cases,
+ensemble-vs-ensemble.
+
+**Wiring (two venvs — pysteps has no wheel for this repo's Python 3.14):**
+`.venv-steps` = isolated uv-managed Python 3.12 + pysteps 1.21.1 (wheels, no
+compile). `scripts/steps_extract_cases.py` (MAIN venv) dumps the exact wettest-400
+Aalborg TEST cases → `ab_eval/steps_cases.npz`; `scripts/eval_steps_baseline.py`
+(3.12 venv, pure numpy/pysteps) scores STEPS + dense-LK extrapolation +
+neighbourhood-prob with the IDENTICAL genesis/decay masks + Brier/BSS as
+`eval_aalborg_ab.py` (cross-checks eul/lag_sv Brier to prove the case sets match).
+timestep=10min (DMI cadence), not the old wrapper's 5.
+- ⚠️ ENV NOTE: `uv run` re-syncs `.venv` to the lockfile and DELETES the
+  maturin-built `dgmr_py` (unmanaged). Restored by copying
+  `dgmr-py/target/release/libdgmr_py.so` → site-packages. **Use `.venv/bin/python`
+  directly, NOT `uv run`,** for anything needing the rust loader.
+
+**The smoke test (12 wettest) gave STEPS BSS −179 vs Eulerian @0.1mm — impossible
+for the operational standard → instrumented it. Not a STEPS bug; an eval confound.**
+
+**Quantified over all 400 "wettest" A/B cases:**
+- **Saturation bias:** median truth coverage @0.1mm = 0.79; **39% of cases >90%
+  wet, 20% >99% wet** at every lead; 35% already raining over >95% of the domain
+  at t0. "It keeps raining everywhere" is trivially correct there → Eulerian
+  near-perfect (Brier 0.002 on the top-12); advection that moves the field only
+  hurts.
+- **Domain too small (boundary inflow):** median motion 8.7 px/step (p90 17.6).
+  **+30min → 21% of the 128px domain is unknowable inflow** from outside the crop;
+  **+40min → 27%** (>25% for 55% of cases); +80min → 55%. STEPS/advection assume
+  DRY inflow → wet-fraction decays 89%→26% while truth stays 100% wet = a crop-size
+  artifact, not meteorology.
+
+**Implication — the A/B "prob beats persistence/advection" is partly artifact** of
+(1) selecting the saturated regime (rewards persistence-like prediction) and (2)
+full-domain scoring (penalizes advection for inflow it can't see). The prob edge
+over Eulerian on the full 400 is real (Brier 0.121 vs 0.246 @0.1mm) but inflated by
+both. A fair STEPS bar needs **interior-only scoring** (exclude the inflow-reachable
+margin) on a **representative (stratified) sample**, and the models re-scored on the
+same interior mask (ab_eval is full-domain only).
+
+**Strongest structural lever for "will it rain in 30-40 min" (now quantified):** the
+128px input crop is too small — a fifth to a quarter of the target-lead forecast is
+inflow the model can't see. **Larger spatial input context** (input ≫ output,
+MetNet-style) is the radar-side fix; it also reframes "genesis" (some is
+inflow-from-outside, per diag_genesis). Next direction logged with the user.
+
+## 2026-06-01 — growth metric corrected: advection-residual GENESIS (the dry@t0 metric was wrong)
+
+**Why:** the "initiation" metric (`dry@t0 → rain@lead`) **conflated advection with
+genesis.** A front advecting across the domain lights up huge swaths of dry@t0
+pixels as "initiation" — the visual showcase was exactly that (init frac 0.83 = a
+moving band, not rain from nowhere). Worse, **Eulerian's 0 init-POD was an
+artifact** (it can't move), so "beats blind persistence on growth" was the wrong
+framing; the right reference is Lagrangian (advection), and the prob model's edge
+over *that* (0.304 vs 0.195) might just be "better advection," not genesis.
+
+**Fix (`eval_aalborg_ab.py`):** replaced the dry@t0 set with **GENESIS pixels =
+advection predicts dry (lag < thr) AND > `1.5·|motion|·lead + 8 px` from any t0
+echo** (distance transform on the t0-rain mask). Rain there cannot have advected
+from any existing echo → genuine formation. Scored each forecaster's Brier + BSS +
+POD on that set (proper: the set is defined by t0/advection, not by truth). Added a
+symmetric **DECAY** set (advection predicts rain; does the model anticipate
+clearing?), BSS vs Lagrangian. Sanity check (smoke): on genesis pixels `lag` and
+`eul` have identical Brier and POD = 0 — now a **fair** 0 (the rain is new),
+confirming the conditioning is right. The overall-Brier (obj 1/6) section is
+unchanged — the architecture verdict never depended on the growth metric.
+
+**Showcase fix (`plot_aalborg_ab.py`):** evolution case now selected by max genesis
+pixel count (not max dry@t0→rain), with the genesis pixels overlaid in lime so
+"rain forming where advection can't reach" is visible per lead.
+
+**RESULT (400 Aalborg test cases, BSS vs persistence, 95% CI) — the honest growth picture:**
+
+| | thr | prob | diff_cal | note |
+|---|---|---|---|---|
+| **Genesis Brier BSS** | 0.1 | +0.120 [.071,.207] | +0.169 [.120,.252] | both modest; diff edges here |
+| (vs persistence) | 1.0 | **+0.154** [.108,.203] | +0.116 [.094,.135] | prob edges |
+| | 5.0 | **+0.062** [.039,.082] | −0.018 [−.043,−.001] | prob +, diff **negative** |
+| **Genesis POD@0.5** | 0.1 | 0.055 | — | both LOW in absolute terms |
+| | 1.0 | **0.070** | 0.001 (diff) | prob ≫ diff, but ≤7% caught |
+| | 5.0 | 0.011 | 0.000 (diff) | genesis barely forecast at all |
+| **Decay Brier BSS** | 1.0 | **+0.579** | +0.394 | vs Lagrangian; prob anticipates clearing |
+| (vs Lagrangian) | 5.0 | **+0.875** | +0.826 | |
+
+**What changed vs the broken metric:** the inflated "+0.578 init-Brier / 0.304
+init-POD" collapsed. On *true* genesis, the edge over persistence is **modest
+(BSS ~+0.12–0.17)** and **absolute genesis POD is low (≤7% at 1 mm)** — radar-only
+models barely forecast rain-from-nowhere. **The user was right: most of the old
+"growth skill" was advection.** What survives, honestly:
+- prob ≥ diffusion on genesis (decisively on POD at 1/5 mm, and the only one
+  positive at 5 mm); diffusion essentially never fires genesis at 0.5 PoP.
+- **prob clearly beats persistence on DECAY** (anticipates clearing: BSS +0.58/+0.88
+  at 1/5 mm) — the other half of obj 4, and a real win.
+- **overall Brier (obj 1/6) unchanged → architecture verdict intact.**
+
+**Implication:** genesis is the genuine weak spot — the strongest quantitative case
+yet for **NWP/temperature conditioning** (convective initiation is unforecastable
+from radar alone). Prob-nowcaster stays the core (better probability + decay,
+modestly better genesis, ~400× cheaper). `eval_aalborg_ab.py`, summary.json.
+Caveat: the distance gate removes the bulk of advection-in but can't perfectly
+separate true formation from single-vector-advection mis-placement.
+
+## 2026-06-01 — Aalborg #2 training converged; architecture A/B eval built + running
+
+**#2 training DONE (`models/prob_nowcaster_aalborg`).** Converged: `val_brier`
+0.0223 → **0.0172 by ~epoch 30**, then dead-flat for ~90 more epochs (123 total,
+~2.3 passes over the 1.7M Aalborg train rows). The LR decaying to ~0 by epoch ~40
+is a *consequence* of the plateau (`ReduceLROnPlateau(patience=3)` on `val_brier`),
+**not a cause** — the model genuinely converged. So the Aalborg restriction did its
+job: **no undertraining confound**, the A/B is fair. Per-threshold val Brier
+0.032 / 0.017 / 0.003 (0.1/1.0/5.0 mm) — tiny, but meaningless without the
+persistence reference on the same cases (rain is rare → low Brier is cheap).
+
+**Built `scripts/eval_aalborg_ab.py` — the Tier-1 architecture A/B.** Scores four
+forecasters on the **same Aalborg held-out TEST cases** (temporal split, clean for
+the prob model) over the 8-lead / +40 min window:
+- `prob` (the new nowcaster, native sigmoid prob),
+- `diff_raw` / `diff_cal` (diffusion ensemble PoP, raw + the all-Denmark
+  recalibration applied),
+- `lag` / `eul` (Lagrangian / Eulerian persistence).
+Decision metrics (NOT pooled CSI): **(1) Brier + BSS-vs-Eulerian** per threshold
+(obj 1/6); **(2) Brier + BSS on INITIATION pixels only (dry@t0)** — threshold-free
+growth skill (obj 4), where persistence is ~blind by construction; **(3) init/diss
+POD @0.5**. Bootstrap 95% CIs over cases on the headline BSS (honest noise).
+**Caveat baked in:** the diffusion model trained on the all-Denmark *random* split
+→ it has seen these test days (leakage = an unfair advantage to diffusion). So if
+`prob` matches/beats `diff` here, the conclusion to switch is robust.
+
+**RESULT (400 wettest Aalborg test cases × 32 members; BSS vs Eulerian, 95% CI):**
+
+| metric | thr | prob (raw) | diff_cal | diff_raw | persistence |
+|---|---|---|---|---|---|
+| **Brier overall** | 0.1 | **+0.508** [.484,.531] | +0.507 [.486,.526] | +0.325 | lag −0.53 |
+| | 1.0 | **+0.482** [.462,.502] | +0.351 [.324,.378] | +0.071 | lag +0.03 |
+| | 5.0 | **+0.476** [.436,.514] | +0.425 [.384,.463] | +0.404 | lag +0.14 |
+| **Brier on init px** | 0.1 | +0.578 [.544,.611] | +0.580 [.548,.613] | +0.443 | lag +0.14 |
+| (dry@t0, growth) | 1.0 | **+0.377** [.354,.401] | +0.270 [.252,.288] | +0.097 | lag −0.05 |
+| | 5.0 | **+0.103** [.085,.120] | +0.031 [.023,.037] | +0.009 | lag −0.38 |
+| **init POD @0.5** | 0.1 | **0.504** | — | 0.254 | lag 0.250 |
+| | 1.0 | **0.304** | — | 0.009 | lag 0.195 |
+| | 5.0 | 0.038 | — | 0.000 | lag 0.067 |
+
+**Verdict — the prob-nowcaster wins the A/B, decisively and robustly:**
+1. **Matches or beats the diffusion model on BOTH decision axes at every
+   threshold** — ties at 0.1 mm, *clearly* wins at 1.0 mm (disjoint CIs on both
+   Brier and init-Brier) and 5.0 mm. Most reliable signal (1.0 mm): Brier BSS
+   +0.482 vs +0.351.
+2. It does so with its **raw native probabilities — no recalibration**. The
+   diffusion model needs a post-hoc calibration (fit on *other* data) just to get
+   close, and *still* loses at 1.0 mm (diff_raw BSS there is only +0.071 — badly
+   miscalibrated). This is "calibrated by construction" made concrete.
+3. **~400× fewer params, one forward vs 32-member sampling** (eval wall-clock:
+   prob = 400 forwards in seconds; diffusion = 12 800 samples in ~29 min).
+4. On **growth (obj 4)** it crushes everything: init POD@1.0 mm **0.304** vs
+   diffusion 0.009 (diffusion is too timid to ever fire at 0.5 PoP) vs Lagrangian
+   0.195. Its balanced init/diss (0.50/0.55 @0.1 mm) shows real discrimination, not
+   the diffusion model's dry-out (diss≈1.0, init≈0 at 1/5 mm).
+5. **Both** learned models beat persistence on Brier + initiation (obj 4, 5
+   satisfied) — but the prob model is the better, cheaper probability vehicle.
+6. **The result is conservative:** the diffusion model trained on these test days
+   (random-split leakage = an unfair advantage) and still lost.
+
+**Honest scope:** wettest 400 cases, +40 min, POD at a single 0.5 operating point;
+diff_cal transfers an all-Denmark calibration to Aalborg (the *generous* reading
+for diffusion — prob still wins). Primary metric (Brier/BSS) is threshold-free with
+tight CIs. **Decision: adopt the probabilistic nowcaster as the core** (retrain.md
+Tier-1 resolved); the LDM's residual value is obj 3 (realistic fields) only.
+
+## 2026-05-31 — #1 PoP recalibration (success) + #2 probabilistic nowcaster, training on Aalborg (obj 7)
+
+**#1 — PoP recalibration works (`scripts/recalibrate_pop.py`).** Isotonic (PAVA,
+sklearn absent), fit on a calibration split, validated on a disjoint split (330
+cases). Held-out: Brier improves (BSS +0.21 / +0.30 / +0.07 at 0.1/1.0/5.0 mm),
+reliability gap collapses (1.0 mm 0.54 → 0.04). Mapping saved
+(`val_large_eval/pop_calibration.npz`; apply via `np.interp`). **The probability
+product is now shippable — "30% means 30%."**
+
+**#2 — probabilistic nowcaster built** (`ldcast/models/nowcast/prob_nowcast.py`,
+`scripts/train_prob_nowcaster_rust.py`). Same AFNO backbone the diffusion model
+conditions on (`AFNONowcastNetBase` + frozen AE) + a per-threshold BCE probability
+head. **1.6M trainable params (~400x smaller than the 670M diffusion model), one
+forward, calibrated by construction.** CPU shape check + GPU smoke pass.
+
+**Obj 7 — Aalborg restriction** (`rust_data.py`: new `region_center` /
+`region_radius` / `dedup_bin0`). Aalborg = pixel (685, 852); 64-px radius → the
+**16 crops containing Aalborg, 1.7M train rows = 1.8% of all-Denmark → ~55x more
+passes/epoch**, clean temporal 80/10/10 (766/96/96 days). This removes the
+undertraining confound that would make the #2 A/B inconclusive — the model can
+actually converge.
+
+**#2 training launched on Aalborg** (background, time-boxed 6 h): natural
+distribution (`use_weighted_sampler=False`, `dedup_bin0=False` → calibrated by
+construction), temporal split, `val_brier` checkpointed. **The test:** does a cheap,
+converged probabilistic model beat (a) persistence (obj 5) and (b) the diffusion
+model on Brier + initiation POD, evaluated on Aalborg held-out test? Eval is the
+next step once trained.
+
+## 2026-05-31 — Step 0b: the model loses on detection but WINS probabilistically (Brier) + on light-rain initiation
+
+**What:** Extended `eval_val_large.py` to score the model vs Lagrangian/Eulerian
+persistence on (a) **growth/decay** (initiation = dry@t0→rain@lead; dissipation =
+rain@t0→dry@lead) and (b) **Brier** (model PoP vs persistence's 0/1), on the same
+660 held-out cases. (CSI/season/FSS unchanged from the big eval — confirmed
+reproducible.)
+
+**Growth/decay — initiation POD (caught rain growing from dry):**
+
+| thr | model | Lagrangian | Eulerian |
+|---|---|---|---|
+| 0.1 | **0.257** | 0.213 | 0.000 |
+| 1.0 | 0.077 | **0.168** | 0.000 |
+| 5.0 | 0.012 | **0.079** | 0.000 |
+
+The model **beats advection at light-rain initiation** (0.257 > 0.213) — its real
+niche, where persistence is blind. It **loses** at moderate/heavy initiation
+(under-production). Dissipation POD is high for the model (0.72/0.94/0.99) but that
+is a **timidity artifact** — it under-produces rain → predicts dry → "catches"
+clearing by default; not real skill (it rises toward 1.0 as the threshold rises,
+the tell). Eulerian is 0/0 by construction.
+
+**Brier (lower=better) + skill score vs persistence:**
+
+| thr | model | Lag | Eul | BSS vs Lag | BSS vs Eul |
+|---|---|---|---|---|---|
+| 0.1 | 0.132 | 0.251 | 0.207 | **+0.476** | **+0.363** |
+| 1.0 | 0.118 | 0.142 | 0.156 | +0.169 | +0.246 |
+| 5.0 | 0.020 | 0.026 | 0.032 | +0.243 | +0.388 |
+
+As a **probabilistic** forecast the model **beats persistence at every threshold.**
+Caveats: persistence here is a deterministic 0/1 forecast — a *weak* probabilistic
+bar (hedging alone beats it); a neighbourhood/calibrated-persistence probability
+would be fairer. And the model's PoP is miscalibrated, so **recalibration would
+WIDEN its Brier edge.**
+
+**Verdict (resolves the Step-0 contradiction):** the model is NOT worthless — it
+loses to persistence on *bulk deterministic detection* (CSI), but **wins on the two
+axes the objectives actually name**: probability (Brier BSS +0.17…+0.48) and
+light-rain growth (init POD 0.257 vs 0.213). Persistence is strong at "rain stays
+put," blind at "new rain forms"; the model is the opposite. So the architecture
+question is now fair and sharp: **can a cheaper deterministic probabilistic nowcaster
+match the diffusion model's Brier-skill + initiation POD** (one forward, native
+calibration)? Decision metrics going forward = **Brier-skill-vs-persistence +
+initiation POD**, NOT pooled CSI.
+
+## 2026-05-31 — Step 0 (retrain): the model LOSES to persistence — fails objective 5
+
+**What:** New `scripts/eval_persistence_baseline.py` (scipy-only; pysteps/cv2 absent).
+Lagrangian persistence (single global FFT phase-correlation motion vector +
+`scipy.ndimage.shift` advection) and Eulerian persistence (hold the last frame),
+scored on the **same 660 held-out cases** as `eval_val_large.py`, vs the model's
+numbers from `val_large_eval/summary.json`.
+
+**Result (CSI, identical cases & code):**
+
+| thr | model pm-mean | model members | Lagrangian | Eulerian |
+|---|---|---|---|---|
+| 0.1 | 0.532 | 0.495 | 0.421 | **0.563** |
+| 1.0 | 0.151 | 0.128 | 0.260 | **0.301** |
+| 5.0 | 0.019 | 0.014 | 0.088 | **0.083** |
+
+**The model fails objective 5.** It loses to even **Eulerian** persistence (hold the
+last frame, zero modelling) at moderate (0.30 vs 0.15) and heavy (0.08 vs 0.02) rain,
+and is at best a **wash** at light rain (Eul 0.56 vs model 0.53). The crude
+single-vector Lagrangian *underperforms* Eulerian at low thresholds (an
+implementation limit — dense optical flow / pysteps would be >= Eulerian), so
+**Eulerian is the robust, unarguable bar**, and proper Lagrangian only widens the
+gap. Stable across the 33-case smoke and the 660-case run.
+
+**Consistent with the under-production diagnosis:** the model is timid (eps-MSE,
+under-dispersed) -> its pm-mean field is too dry -> it loses to "just keep the rain."
+The diffusion model is *actively destroying information* relative to the trivial
+baseline.
+
+**Growth/decay metric validated and persistence's bar set:** Eulerian has **exactly
+0** initiation and 0 dissipation skill (can't create or clear rain). Lagrangian:
+initiation POD 0.21 / 0.17 / 0.08 and dissipation 0.66 / 0.72 / 0.87 at
+0.1/1.0/5.0 mm. **The MODEL's growth/decay is NOT yet measured** — it's the *only*
+place the model can justify itself over persistence (obj 4), and is the next required
+run (fold initiation/dissipation into `eval_val_large.py`).
+
+**Implications:** (1) strengthens the architecture reconsideration in `retrain.md` —
+an expensive diffusion model that loses to holding the last frame is not delivering;
+(2) before any retrain, measure the model's growth/decay **and** probabilistic (Brier)
+skill vs persistence. **Caveat:** CSI is deterministic detection; the model is
+probabilistic, so its unmeasured potential edges are growth/decay + a *calibrated*
+PoP — both unrealised today (PoP is miscalibrated).
+
 ## 2026-05-31 — Large held-out eval (660 cases x 32 members): heavy rain weak everywhere, no usable regime, PoP needs recalibration
 
 **What:** New `scripts/eval_val_large.py` — a one-off, cross-case-batched eval

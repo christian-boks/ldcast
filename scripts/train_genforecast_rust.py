@@ -52,11 +52,19 @@ def train(
     seed=42,
     use_weighted_sampler=False,
     max_nocoverage_frac=0.05,
+    region_center=None,        # (cx,cy) Aalborg pixel; None = all Denmark
+    region_radius=64,
+    input_pad=0,               # >0 loads (height+2*pad)^2 windows centred on the crop (192 -> 512)
+    dedup_bin0=True,
+    init_weights=None,         # warm-start WEIGHTS only (accepts .ckpt or .pt); not a full resume
+    strict_weights=True,
+    use_ema=True,              # False frees the ~2.7 GB EMA shadow (+ its val-time copy) for tight VRAM
     model_dir="../models/genforecast_rust",
     lr=1e-4,
     ckpt_path=None,
     precision="bf16-mixed",
     optimizer_8bit=False,
+    use_checkpoint=False,
     max_epochs=1000,
     limit_train_batches=None,
     limit_val_batches=None,
@@ -67,7 +75,9 @@ def train(
     early_stopping_patience=6,
     accumulate_grad_batches=1,
     save_top_k=3,
+    cudnn_benchmark=True,      # set False for tight-VRAM runs: benchmark picks workspace-heavy convs
 ):
+    torch.backends.cudnn.benchmark = cudnn_benchmark
     if index_path is None:
         index_path = os.environ["DGMR_RADAR_INDEX"]
     if autoenc_weights_fn is None:
@@ -92,6 +102,10 @@ def train(
         seed=seed,
         use_weighted_sampler=use_weighted_sampler,
         max_nocoverage_frac=max_nocoverage_frac,
+        region_center=region_center,
+        region_radius=region_radius,
+        input_pad=input_pad,
+        dedup_bin0=dedup_bin0,
     )
 
     print("Setting up model...")
@@ -104,6 +118,7 @@ def train(
         lr=lr,
         precision=precision,
         optimizer_8bit=optimizer_8bit,
+        use_checkpoint=use_checkpoint,
         max_epochs=max_epochs,
         limit_train_batches=limit_train_batches,
         limit_val_batches=limit_val_batches,
@@ -116,6 +131,18 @@ def train(
         save_top_k=save_top_k,
     )
     gc.collect()
+
+    if init_weights is not None:
+        print(f"Warm-starting (weights only) from {init_weights}...")
+        sd = torch.load(init_weights, map_location="cpu")
+        sd = sd.get("state_dict", sd)   # accept a Lightning .ckpt or a raw state_dict .pt
+        ldm.load_state_dict(sd, strict=strict_weights)
+
+    if not use_ema:
+        ldm.use_ema = False     # drop the EMA shadow + its val-time param copy to fit VRAM
+        ldm.model_ema = None
+        gc.collect()
+        torch.cuda.empty_cache()
 
     print("Starting training...")
     trainer.fit(ldm, datamodule=dm, ckpt_path=ckpt_path)

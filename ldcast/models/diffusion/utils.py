@@ -119,6 +119,14 @@ class CheckpointFunction(torch.autograd.Function):
         ctx.run_function = run_function
         ctx.input_tensors = list(args[:length])
         ctx.input_params = list(args[length:])
+        # Capture autocast state so the backward recompute runs at the same
+        # precision as the forward. Without this, the recomputed ops see bf16
+        # activations but fp32 params under mixed precision -> dtype mismatch.
+        ctx.autocast_enabled = torch.is_autocast_enabled()
+        ctx.autocast_dtype = (
+            torch.get_autocast_dtype("cuda")
+            if hasattr(torch, "get_autocast_dtype") else torch.bfloat16
+        )
 
         with torch.no_grad():
             output_tensors = ctx.run_function(*ctx.input_tensors)
@@ -127,7 +135,9 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *output_grads):
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
-        with torch.enable_grad():
+        with torch.enable_grad(), torch.autocast(
+            "cuda", dtype=ctx.autocast_dtype, enabled=ctx.autocast_enabled
+        ):
             # Fixes a bug where the first op in run_function modifies the
             # Tensor storage in place, which is not allowed for detach()'d
             # Tensors.

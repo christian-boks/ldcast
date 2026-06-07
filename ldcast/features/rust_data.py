@@ -73,6 +73,7 @@ class RustRadarDataset(Dataset):
         full_frame: bool,
         cache_capacity: int,
         max_nocoverage_frac: float = 1.0,
+        input_pad: int = 0,
     ):
         assert ts.shape == x.shape == y.shape, "ts/x/y arrays must share shape"
         self.ts = ts
@@ -85,6 +86,13 @@ class RustRadarDataset(Dataset):
         self.full_frame = full_frame
         self.cache_capacity = cache_capacity
         self.max_nocoverage_frac = max_nocoverage_frac
+        # input_pad>0 loads a (height+2*pad)^2 window CENTERED on the catalog crop
+        # (load at x-pad,y-pad) instead of the height^2 crop itself, giving the
+        # model wider spatial context while the target stays the centre height^2
+        # (the consumer crops the prediction/target back, e.g. ProbNowcaster
+        # output_crop). The catalog (x,y) and region filter are unchanged: the
+        # loaded window's centre == the original crop's centre.
+        self.input_pad = input_pad
         # Worker-local state, allocated on first __getitem__ inside the worker
         # process (each DataLoader worker gets its own cache after fork).
         self._cache = None
@@ -113,15 +121,19 @@ class RustRadarDataset(Dataset):
         last_err = None
         for attempt in range(_MAX_LOAD_RETRIES):
             i = (idx + attempt) % n
-            entry = dgmr_py.make_entry(int(self.ts[i]), int(self.x[i]), int(self.y[i]))
+            entry = dgmr_py.make_entry(
+                int(self.ts[i]),
+                int(self.x[i]) - self.input_pad,
+                int(self.y[i]) - self.input_pad,
+            )
             try:
                 past, future = dgmr_py.load_sample(
                     entry,
                     self._cache,
                     self.past_steps,
                     self.future_steps,
-                    self.height,
-                    self.width,
+                    self.height + 2 * self.input_pad,
+                    self.width + 2 * self.input_pad,
                     self.full_frame,
                 )
             except RuntimeError as e:
@@ -205,7 +217,9 @@ class LDCastEqualFrequencySampler(Sampler[int]):
 
 # ---- DataModule -------------------------------------------------------------
 def _load_ldcast_index(path: str, valid_frac: float, seed: int,
-                       test_frac: float = 0.0, split_mode: str = "random"):
+                       test_frac: float = 0.0, split_mode: str = "random",
+                       region_center=None, region_radius: int = 64,
+                       dedup_bin0: bool = True):
     """Parse + split + bin-0-dedup the LDCast index file.
 
     Returns three (ts, x, y, w) tuples: (train, val, test). `test` is empty
@@ -239,6 +253,22 @@ def _load_ldcast_index(path: str, valid_frac: float, seed: int,
     n_total = int(ts.shape[0])
     if n_total == 0:
         raise RuntimeError(f"no entries parsed from {path}")
+
+    # Optional spatial restriction: keep only crops whose 128-px window is
+    # centred within `region_radius` px of region_center=(cx,cy) (crop top-left
+    # + 64 = centre). Shrinks the data so a model sees the same area many times
+    # (e.g. Aalborg = (685, 852)) -> it can actually converge.
+    if region_center is not None:
+        cx, cy = region_center
+        xi = x.astype(np.int32); yi = y.astype(np.int32)
+        m = ((np.abs(xi + 64 - cx) <= region_radius) &
+             (np.abs(yi + 64 - cy) <= region_radius))
+        ts, x, y, w = ts[m], x[m], y[m], w[m]
+        n_total = int(ts.shape[0])
+        if n_total == 0:
+            raise RuntimeError(
+                f"region (center={region_center}, r={region_radius}) left 0 rows")
+        del xi, yi, m
 
     rng = np.random.default_rng(seed)
     # In both modes: train_idx is kept ASCENDING (the index is emitted in
@@ -290,18 +320,23 @@ def _load_ldcast_index(path: str, valid_frac: float, seed: int,
     test_w = w[test_idx]
     del ts, x, y, w, train_idx, val_idx, test_idx
 
-    w_min = train_w.min()
-    bin0_mask = train_w == w_min
-    bin0_pop = int(bin0_mask.sum())
-    if bin0_pop > 1:
-        keep = ~bin0_mask
-        rep = int(np.flatnonzero(bin0_mask)[0])
-        train_ts = np.concatenate([train_ts[keep], train_ts[rep : rep + 1]])
-        train_x = np.concatenate([train_x[keep], train_x[rep : rep + 1]])
-        train_y = np.concatenate([train_y[keep], train_y[rep : rep + 1]])
-        train_w = np.concatenate(
-            [train_w[keep], np.array([w_min * bin0_pop], dtype=train_w.dtype)]
-        )
+    # Bin-0 dedup (TRAIN only) -- collapse the ~65% empty crops to one weighted
+    # representative for the equal-frequency sampler. Disable (dedup_bin0=False)
+    # to train on the NATURAL rain frequency, e.g. for a calibrated-by-
+    # construction probabilistic model.
+    if dedup_bin0:
+        w_min = train_w.min()
+        bin0_mask = train_w == w_min
+        bin0_pop = int(bin0_mask.sum())
+        if bin0_pop > 1:
+            keep = ~bin0_mask
+            rep = int(np.flatnonzero(bin0_mask)[0])
+            train_ts = np.concatenate([train_ts[keep], train_ts[rep : rep + 1]])
+            train_x = np.concatenate([train_x[keep], train_x[rep : rep + 1]])
+            train_y = np.concatenate([train_y[keep], train_y[rep : rep + 1]])
+            train_w = np.concatenate(
+                [train_w[keep], np.array([w_min * bin0_pop], dtype=train_w.dtype)]
+            )
 
     return (
         (train_ts, train_x, train_y, train_w),
@@ -326,13 +361,19 @@ class RustRadarDataModule(pl.LightningDataModule):
         valid_frac: float = 0.1,
         test_frac: float = 0.0,
         split_mode: str = "random",
+        region_center=None,
+        region_radius: int = 64,
+        dedup_bin0: bool = True,
         seed: int = 42,
         use_weighted_sampler: bool = False,
         max_nocoverage_frac: float = 0.05,
+        input_pad: int = 0,
     ):
         super().__init__()
         assert mode in ("autoenc", "diffusion"), f"unknown mode {mode!r}"
         assert height % 32 == 0 and width % 32 == 0, "H,W must be divisible by 32"
+        assert (height + 2 * input_pad) % 32 == 0 and (width + 2 * input_pad) % 32 == 0, \
+            "loaded window (H/W + 2*input_pad) must be divisible by 32"
         assert (past_steps + future_steps) % 4 == 0, (
             f"past+future={past_steps + future_steps} not divisible by autoenc time ratio 4"
         )
@@ -348,15 +389,20 @@ class RustRadarDataModule(pl.LightningDataModule):
         self.valid_frac = valid_frac
         self.test_frac = test_frac
         self.split_mode = split_mode
+        self.region_center = region_center
+        self.region_radius = region_radius
+        self.dedup_bin0 = dedup_bin0
         self.seed = seed
         self.use_weighted_sampler = use_weighted_sampler
         self.max_nocoverage_frac = max_nocoverage_frac
+        self.input_pad = input_pad
 
         (
             (self.train_ts, self.train_x, self.train_y, self.train_w),
             (self.val_ts, self.val_x, self.val_y, self.val_w),
             (self.test_ts, self.test_x, self.test_y, self.test_w),
-        ) = _load_ldcast_index(index_path, valid_frac, seed, test_frac, split_mode)
+        ) = _load_ldcast_index(index_path, valid_frac, seed, test_frac, split_mode,
+                               region_center, region_radius, dedup_bin0)
 
     def _ds(self, ts, x, y):
         return RustRadarDataset(
@@ -370,6 +416,7 @@ class RustRadarDataModule(pl.LightningDataModule):
             self.full_frame,
             self.cache_capacity,
             self.max_nocoverage_frac,
+            self.input_pad,
         )
 
     def setup(self, stage=None):

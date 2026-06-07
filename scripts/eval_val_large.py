@@ -41,7 +41,7 @@ from omegaconf import OmegaConf
 import matplotlib
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt
-from scipy.ndimage import uniform_filter
+from scipy.ndimage import uniform_filter, shift as nd_shift
 
 from ldcast.features.rust_data import RustRadarDataModule
 from ldcast.models.diffusion import dpm_solver
@@ -49,6 +49,7 @@ from ldcast.models.genforecast.monitor import SamplePredictionLogger
 from ldcast.visualization.plots import reverse_transform_R
 
 from train_genforecast import setup_model
+from eval_persistence_baseline import estimate_motion
 
 THRESHOLDS = (0.1, 1.0, 5.0)
 FSS_SCALES = (1, 3, 9, 25, 51)        # neighbourhood box widths, pixels
@@ -207,6 +208,10 @@ def run(
     # per-case records (small): bin, month, per-thr (h,m,f), csi, crps
     pc_bin, pc_month, pc_crps = [], [], []
     pc_counts = {t: [] for t in THRESHOLDS}                  # list of (h,m,f) per case
+    # growth/decay (obj 4) + Brier (obj 1/6): model (pm-mean) vs persistence
+    GD_METHODS = ("model", "lag", "eul")
+    gd = {me: {t: [0, 0, 0, 0] for t in THRESHOLDS} for me in GD_METHODS}  # [ic,it,dc,dt]
+    brier = {me: {t: [0.0, 0] for t in THRESHOLDS} for me in GD_METHODS}   # [sse, n_px]
 
     def finalize_case(ci, preds):
         """Extract every metric contribution from a completed case, then free."""
@@ -216,6 +221,14 @@ def run(
         pm = SamplePredictionLogger._pm_mean(stack)         # (T,H,W) det. map
         pc_bin.append(case["bin"]); pc_month.append(case["month"])
         pc_crps.append(crps_ensemble(stack, truth))
+        # persistence forecasts for this case (model-vs-persistence tests)
+        past_mmhr = reverse_transform_R(case["past"][0, 0].float().numpy())  # (Tp,H,W)
+        t0 = past_mmhr[-1]
+        dy, dx = estimate_motion(past_mmhr)
+        eul = np.repeat(t0[None], truth.shape[0], axis=0)        # hold last frame
+        lag = np.stack([nd_shift(t0, (dy * (k + 1), dx * (k + 1)),
+                                 order=1, mode="constant", cval=0.0)
+                        for k in range(truth.shape[0])])         # advect last frame
         for thr in THRESHOLDS:
             o = truth >= thr                          # (T,H,W)
             ob = o[None]                              # broadcast over members
@@ -250,6 +263,25 @@ def run(
                 pc = pop_counts[(thr, c)]
                 pc[0] += int((dec & o).sum()); pc[1] += int((~dec & o).sum())
                 pc[2] += int((dec & ~o).sum())
+            # growth/decay (pm-mean vs persistence) + Brier (PoP vs persistence 0/1)
+            t0b = t0 >= thr                                  # (H,W)
+            fcsts = {"model": pmb, "lag": lag >= thr, "eul": eul >= thr}  # each (T,H,W)
+            for lt in range(truth.shape[0]):
+                init = (~t0b) & o[lt]                        # dry@t0 -> rain@lead
+                diss = t0b & (~o[lt])                        # rain@t0 -> dry@lead
+                it, dt = int(init.sum()), int(diss.sum())
+                for me in GD_METHODS:
+                    fb = fcsts[me][lt]
+                    g = gd[me][thr]
+                    g[0] += int((fb & init).sum()); g[1] += it
+                    g[2] += int((~fb & diss).sum()); g[3] += dt
+            of = o.astype(np.float32)                        # (T,H,W) 0/1 truth
+            brier["model"][thr][0] += float(((pop - of) ** 2).sum())
+            brier["model"][thr][1] += of.size
+            brier["lag"][thr][0] += float((((lag >= thr).astype(np.float32) - of) ** 2).sum())
+            brier["lag"][thr][1] += of.size
+            brier["eul"][thr][0] += float((((eul >= thr).astype(np.float32) - of) ** 2).sum())
+            brier["eul"][thr][1] += of.size
 
     # ---- cross-case batched sampling ----
     print("Sampling...")
@@ -289,12 +321,14 @@ def run(
     # ---- aggregate + report ----
     _report(out_dir, cases, num_bins, bin_counts, lead_counts, pm_counts,
             rel_obs, rel_cnt, rel_psum, pop_counts, fss_num, fss_den,
-            pc_bin, pc_month, pc_crps, pc_counts, ensemble_size, per_bin_cases)
+            pc_bin, pc_month, pc_crps, pc_counts, ensemble_size, per_bin_cases,
+            gd, brier)
 
 
 def _report(out_dir, cases, num_bins, bin_counts, lead_counts, pm_counts,
             rel_obs, rel_cnt, rel_psum, pop_counts, fss_num, fss_den,
-            pc_bin, pc_month, pc_crps, pc_counts, M, per_bin_cases):
+            pc_bin, pc_month, pc_crps, pc_counts, M, per_bin_cases,
+            gd, brier):
     pc_bin = np.array(pc_bin); pc_month = np.array(pc_month)
     pc_crps = np.array(pc_crps)
     summary = {"design": {"cases": len(cases), "members": M,
@@ -380,6 +414,35 @@ def _report(out_dir, cases, num_bins, bin_counts, lead_counts, pm_counts,
     # PoP operating curve (overall) + reliability — saved to json, plotted below
     summary["pop_sweep"] = {str(t): {float(c): csi_pod_far(*pop_counts[(t, c)])[1:]
                                      for c in POP_CUTOFFS} for t in THRESHOLDS}
+
+    # growth/decay (obj 4): model pm-mean vs persistence
+    print("\n=== GROWTH/DECAY: model (pm-mean) vs persistence  (obj-4 test) ===")
+    print("  init POD = caught rain growing from dry@t0;  diss = caught clearing")
+    summary["growth_decay"] = {}
+    for thr in THRESHOLDS:
+        rec = {}; cells = [f"  {thr}mm |"]
+        for me in ("model", "lag", "eul"):
+            ic, it, dc, dt = gd[me][thr]
+            ip = ic / it if it else float("nan")
+            dp = dc / dt if dt else float("nan")
+            rec[me] = {"init_pod": ip, "diss_pod": dp}
+            cells.append(f" {me}: init {ip:.3f} diss {dp:.3f} |")
+        summary["growth_decay"][str(thr)] = rec
+        print("".join(cells))
+
+    # Brier (obj 1/6): model PoP vs persistence 0/1 + skill score
+    print("\n=== BRIER (lower=better) + skill vs persistence  (obj-1/6 test) ===")
+    summary["brier"] = {}
+    for thr in THRESHOLDS:
+        bm = brier["model"][thr][0] / brier["model"][thr][1]
+        bl = brier["lag"][thr][0] / brier["lag"][thr][1]
+        be = brier["eul"][thr][0] / brier["eul"][thr][1]
+        bss_l = 1 - bm / bl if bl else float("nan")
+        bss_e = 1 - bm / be if be else float("nan")
+        summary["brier"][str(thr)] = {"model": bm, "lag": bl, "eul": be,
+                                      "bss_vs_lag": bss_l, "bss_vs_eul": bss_e}
+        print(f"  {thr}mm Brier: model {bm:.4f}  lag {bl:.4f}  eul {be:.4f}"
+              f"   BSS vs lag {bss_l:+.3f}  vs eul {bss_e:+.3f}")
 
     # ---- save artifacts ----
     with open(out_dir / "summary.json", "w") as fh:
