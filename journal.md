@@ -2090,3 +2090,18 @@ which is baked into the weights — train and infer must use the same value; val
    457 GB disk at ~97 % full.
 10. **Disk hygiene.** Automate `.ckpt` → state_dict extraction in `train_rust.py` and prune large
     checkpoints; the near-full disk repeatedly constrained training (`save_top_k`) and inference.
+
+---
+
+## 2026-06-07 — Literature review: growth/decay & the "sharpness ≠ skill" problem
+
+Ran a deep-research lit review on why the nowcaster/LDCast just advect+blur+decay and never predict
+convective growth/decay/initiation. **Outcome:** the radar-only predictability ceiling is confirmed and
+quantified (Radhakrishna et al. 2012: growth/decay predictable only for scales >100–250 km, ~1–2 h →
+convective-scale life-cycle essentially unpredictable from radar alone). Bonte et al. 2026 show STEPS &
+**LDCast** ensembles are "statistical, not dynamical" (phase-randomized surrogates match their FSS) — but
+on an *out-of-domain, non-fine-tuned* LDCast, so our Aalborg fine-tune is the untested case. No method
+solves growth/decay from radar alone. **DiffCast** (CVPR 2024, deterministic motion μ + stochastic
+residual) is the best-supported architecture for our setup (escapes the AE time-collapse bottleneck; μ
+can be our Lagrangian advection) — but it fixes blur/position/calibration, not growth/decay skill.
+Full report + citations: `research-growth-decay-nowcasting.md`.

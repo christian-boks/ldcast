@@ -15,7 +15,8 @@
       "Bash(DGMR_RADAR_ROOT=/opt/radar_data uv run python /tmp/check_past.py)",
       "Bash(awk '{printf \"%.1f GB  %s\\\\n\", $5/1e9, $NF}')",
       "Bash(awk '{printf \" %.1f GB %s\\\\n\", $5/1e9, $NF}')",
-      "Bash(rm -f models/genforecast_rust/*.ckpt)"
+      "Bash(rm -f models/genforecast_rust/*.ckpt)",
+      "Workflow(deep-research)"
     ]
   }
 }
